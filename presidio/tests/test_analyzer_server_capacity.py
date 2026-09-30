@@ -1074,6 +1074,9 @@ async def _lifespan_emits_safe_ner_startup_events(monkeypatch, caplog):
             "compute_capability": "7.5",
             "cuda_version": "12.6",
             "gpu_memory_total_bytes": 16 * 1024**3,
+            "model_profile": "tiny2",
+            "o_logit_bias": 1.0,
+            "span_postprocessing": "secrets-contracts",
         },
     )
 
@@ -1103,6 +1106,9 @@ async def _lifespan_emits_safe_ner_startup_events(monkeypatch, caplog):
             "compute_capability": "7.5",
             "cuda_version": "12.6",
             "gpu_memory_total_bytes": 16 * 1024**3,
+            "model_profile": "tiny2",
+            "o_logit_bias": 1.0,
+            "span_postprocessing": "secrets-contracts",
         }
     ]
 
