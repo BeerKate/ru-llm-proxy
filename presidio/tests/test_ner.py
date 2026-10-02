@@ -197,6 +197,7 @@ def test_cpu_runtime_is_the_default_and_does_not_move_the_model():
     recognizer = HuggingFaceNERRecognizer(tokenizer=tokenizer, model=model)
 
     assert recognizer.runtime_info() == {
+        "backend": "transformers",
         "profile": "cpu",
         "device": "cpu",
         "precision": "fp32",
@@ -240,6 +241,7 @@ def test_gpu_runtime_moves_model_and_reports_bounded_device_metadata(monkeypatch
 
     assert model.selected_device == "cuda:0"
     assert recognizer.runtime_info() == {
+        "backend": "transformers",
         "profile": "gpu",
         "device": "cuda:0",
         "precision": "fp32",
