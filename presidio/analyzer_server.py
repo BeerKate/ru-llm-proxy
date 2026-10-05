@@ -288,6 +288,7 @@ ANALYZER_REQUEST_ID_HEADER = "X-Ru-LLM-Request-ID"
 ANALYZER_TEXT_FIELD_INDEX_HEADER = "X-Ru-LLM-Text-Field-Index"
 ANALYSIS_SIGNATURE_SCHEMA = "ru-llm-proxy-analyzer-v1"
 ANALYSIS_SIGNATURE_ENV_NAMES = (
+    "PRESIDIO_ANALYZER_NER_BOUNDARY_RECHECK",
     "PRESIDIO_ANALYZER_NER_BACKEND",
     "PRESIDIO_ANALYZER_TRITON_URL",
     "PRESIDIO_ANALYZER_TRITON_MODEL_NAME",
@@ -879,13 +880,19 @@ def _analyze_sync(request: AnalyzeRequest) -> AnalyzeResponse:
             )
 
             _raise_if_cancelled(cancellation_event)
-            ner_results = ner_recognizer.analyze(
-                chunk_text,
+            ner_kwargs = dict(
                 score_threshold=request.score_threshold,
                 entities=ner_entities,
                 telemetry_callback=capture_ner_telemetry,
                 cancellation_event=cancellation_event,
             )
+            if getattr(ner_recognizer, "boundary_recheck_enabled", False) is True:
+                # Chunk-local original coordinates; the recognizer maps its
+                # normalized evidence back before checking this protection.
+                ner_kwargs["protected_spans"] = tuple(
+                    (result.start, result.end) for result in chunk_results
+                )
+            ner_results = ner_recognizer.analyze(chunk_text, **ner_kwargs)
             results.extend(
                 _shift_recognizer_result(result, chunk.start)
                 for result in ner_results

@@ -28,6 +28,9 @@ except ImportError:
     from presidio.entity_types import NER_ENTITY_TYPES
 
 from .span_postprocessing import postprocess_spans
+from .boundary_recheck import (
+    RECHECK_SHELL_PROMPT, confirmed_prompt_edges, prediction_key, resolve_recheck,
+)
 from .backend_settings import resolve_backend
 from .text_processing import TokenWindow, normalize_for_ner, plan_token_windows
 
@@ -625,6 +628,7 @@ class HuggingFaceNERRecognizer:
         ):
             raise ValueError("CPU profile only supports fp32 precision")
         self._profile = profile if profile is not None else ACTIVE_PROFILE
+        self._boundary_recheck = resolve_recheck(self._profile.name)
         self._backend_settings = resolve_backend()
         if self._backend_settings.backend == 'triton':
             if self._profile.name != 'tiny2' or normalized_device_profile != 'cpu':
@@ -683,6 +687,7 @@ class HuggingFaceNERRecognizer:
             "o_logit_bias": self._o_logit_bias,
             "span_postprocessing": self._span_postprocessing,
             "backend": self._backend_settings.backend,
+            "boundary_recheck": self._boundary_recheck,
         }
 
     def gpu_memory_allocated_bytes(self) -> int:
@@ -1056,6 +1061,7 @@ class HuggingFaceNERRecognizer:
         entities: Optional[list[str]] = None,
         telemetry_callback: Callable[[NERInferenceTelemetry], None] | None = None,
         cancellation_event: threading.Event | None = None,
+        protected_spans: tuple[tuple[int, int], ...] | None = None,
     ) -> list[RecognizerResult]:
         started_at = time.perf_counter()
         if not should_run_ner(entities, score_threshold):
@@ -1073,6 +1079,7 @@ class HuggingFaceNERRecognizer:
                 score_threshold=score_threshold,
                 entities=entities,
                 cancellation_event=cancellation_event,
+                protected_spans=protected_spans,
             )
         except NERInferenceCancelled:
             raise
@@ -1112,6 +1119,10 @@ class HuggingFaceNERRecognizer:
         )
         return results
 
+    @property
+    def boundary_recheck_enabled(self) -> bool:
+        return self._boundary_recheck == RECHECK_SHELL_PROMPT
+
     @staticmethod
     def _emit_inference_telemetry(
         callback: Callable[[NERInferenceTelemetry], None] | None,
@@ -1148,6 +1159,7 @@ class HuggingFaceNERRecognizer:
         score_threshold: float,
         entities: Optional[list[str]],
         cancellation_event: threading.Event | None,
+        protected_spans: tuple[tuple[int, int], ...] | None = None,
     ) -> tuple[list[RecognizerResult], int, int]:
         _raise_if_cancelled(cancellation_event)
         if self._state == NER_STATE_FAILED:
@@ -1240,6 +1252,16 @@ class HuggingFaceNERRecognizer:
                 filtered_recovery_predictions,
                 unresolved.unresolved_clusters,
             )
+            if self.boundary_recheck_enabled:
+                input_ids, offsets = self._tokenize_content(normalized.text)
+                withdrawn, additional_windows = confirmed_prompt_edges(
+                    normalized, input_ids, offsets, unresolved.unresolved_clusters,
+                    recovery_predictions, protected_spans, self._infer_window_batch,
+                    lambda: _raise_if_cancelled(cancellation_event),
+                )
+                windows_processed += additional_windows
+                filtered_predictions = [p for p in filtered_predictions
+                                        if prediction_key(p) not in withdrawn]
             try:
                 entity_predictions = merge_window_predictions(
                     filtered_predictions + selected_recovery_predictions

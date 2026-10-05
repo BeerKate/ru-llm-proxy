@@ -209,6 +209,7 @@ def test_cpu_runtime_is_the_default_and_does_not_move_the_model():
         "model_profile": "bert",
         "o_logit_bias": 0.0,
         "span_postprocessing": "none",
+        "boundary_recheck": "off",
     }
     assert model.selected_device is None
 
@@ -253,6 +254,7 @@ def test_gpu_runtime_moves_model_and_reports_bounded_device_metadata(monkeypatch
         "model_profile": "bert",
         "o_logit_bias": 0.0,
         "span_postprocessing": "none",
+        "boundary_recheck": "off",
     }
 
 

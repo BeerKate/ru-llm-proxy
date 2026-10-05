@@ -1033,6 +1033,30 @@ def test_analysis_signature_tracks_registry_source_changes(monkeypatch):
     assert analyzer_server._build_analysis_signature() != baseline
 
 
+def test_boundary_recheck_mode_invalidates_analysis_signature(monkeypatch):
+    monkeypatch.setenv("PRESIDIO_ANALYZER_NER_BOUNDARY_RECHECK", "off")
+    before = analyzer_server._build_analysis_signature()
+    monkeypatch.setenv("PRESIDIO_ANALYZER_NER_BOUNDARY_RECHECK", "shell-prompt")
+    assert analyzer_server._build_analysis_signature() != before
+
+
+def test_boundary_recheck_receives_chunk_local_native_protection(monkeypatch):
+    text = "password=-$"
+    monkeypatch.setattr(analyzer_server.ner_recognizer, "require_ready", lambda: None)
+    monkeypatch.setattr(analyzer_server.ner_recognizer, "_boundary_recheck", "shell-prompt")
+    monkeypatch.setattr(analyzer_server.analyzer, "analyze", lambda **_kwargs: [
+        RecognizerResult(entity_type="PASSWORD", start=9, end=11, score=.99)
+    ])
+    seen = []
+    def analyze_ner(_text, **kwargs):
+        seen.append(kwargs["protected_spans"])
+        return []
+    monkeypatch.setattr(analyzer_server.ner_recognizer, "analyze", analyze_ner)
+    result = analyzer_server._analyze_sync(analyzer_server.AnalyzeRequest(text=text))
+    assert seen == [((9, 11),)]
+    assert any(e["entity_type"] == "PASSWORD" for e in result.entities)
+
+
 def test_lifespan_refuses_to_start_when_required_ner_fails(monkeypatch, caplog):
     asyncio.run(_lifespan_refuses_to_start_when_required_ner_fails(monkeypatch, caplog))
 
