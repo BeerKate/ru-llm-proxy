@@ -20,6 +20,7 @@ def request(base, key, payload):
 def decode(body, stream):
     if not stream:
         result = json.loads(body)
+        assert result["status"] == "completed", result
         output = result["output"][0]
         text = output.get("arguments") or output["content"][0]["text"]
         return result["id"], text
@@ -27,7 +28,17 @@ def decode(body, stream):
               if line.startswith("data:") and line[5:].strip() != "[DONE]"]
     completed = [event for event in events if event.get("type") == "response.completed"]
     assert len(completed) == 1, events
-    return completed[0]["response"]["id"], "".join(event.get("delta", "") for event in events)
+    result = completed[0]["response"]
+    assert result["status"] == "completed", result
+    output = result["output"][0]
+    kind = (
+        "response.function_call_arguments.delta" if output["type"] == "function_call"
+        else "response.output_text.delta"
+    )
+    text = "".join(event.get("delta", "") for event in events if event.get("type") == kind)
+    final_text = output.get("arguments") or output["content"][0]["text"]
+    assert text.encode() == final_text.encode(), (text, final_text)
+    return result["id"], text
 
 
 def run(base="http://localhost:4000", key="sk-test-master"):
@@ -47,10 +58,11 @@ def run(base="http://localhost:4000", key="sk-test-master"):
                 status, body = request(base, key, payload)
                 assert status == 200, (status, body)
                 previous, output = decode(body, stream)
-                assert all(value in output for value in expected), output
                 assert "<EMAIL_ADDRESS_" not in output, output
                 if tool:
-                    assert json.loads(output)["values"] == expected
+                    assert json.loads(output) == {"values": expected}
+                else:
+                    assert output.encode() == " / ".join(expected).encode(), output
                 count += 1
             # Native authentication must reject an invalid/revoked key before
             # guardrails can resolve the response owned by a valid key.

@@ -62,6 +62,62 @@ class _WireStream(httpx.AsyncByteStream):
 async def test_round_trip_through_litellm_parser(
     api, output_kind, stream, replacement, entity_type, llm_logging_lifecycle
 ):
+    await _round_trip_through_litellm_parser(
+        api, output_kind, stream, replacement, entity_type
+    )
+
+
+MODEL_RESPONSE_CASES = [
+    pytest.param("bare", "{value}", "{value}", True, id="bare-marker"),
+    pytest.param("label", "Base64: {value}", "Base64: {value}", True, id="label-kept"),
+    pytest.param("label", "{value}", "{value}", False, id="label-deleted"),
+    pytest.param(
+        "bare", "Это шаблон: {value}. Пришлите настоящий адрес.",
+        "Это шаблон: {value}. Пришлите настоящий адрес.", False,
+        id="marker-in-explanation",
+    ),
+    pytest.param("bare", "<email_address_1>", "<email_address_1>", False, id="changed-marker"),
+    pytest.param("bare", "Метка удалена.", "Метка удалена.", False, id="deleted-marker"),
+    pytest.param("bare", "<EMAIL_ADDRESS_99>", "<EMAIL_ADDRESS_99>", False, id="unknown-marker"),
+    pytest.param("repeat", "{value} / {value}", "{value} / {value}", True, id="repeated-marker"),
+]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("api", ["chat", "responses"])
+@pytest.mark.parametrize("output_kind", ["text", "arguments"])
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize(
+    ("instruction", "provider_template", "client_template", "instruction_obeyed"),
+    MODEL_RESPONSE_CASES,
+)
+async def test_model_response_behavior_does_not_change_restoration_contract(
+    api, output_kind, stream, instruction, provider_template, client_template,
+    instruction_obeyed, llm_logging_lifecycle,
+):
+    await _round_trip_through_litellm_parser(
+        api, output_kind, stream, "behavior", "EMAIL_ADDRESS",
+        behavior=(instruction, provider_template, client_template, instruction_obeyed),
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("api", ["chat", "responses"])
+@pytest.mark.parametrize("stream", [False, True])
+async def test_model_tool_refusal_is_not_a_successful_tool_call(
+    api, stream, llm_logging_lifecycle,
+):
+    explanation = "Это шаблон: {value}. Пришлите настоящий адрес."
+    await _round_trip_through_litellm_parser(
+        api, "text", stream, "behavior", "EMAIL_ADDRESS",
+        behavior=("bare", explanation, explanation, False), require_tool=True,
+    )
+
+
+async def _round_trip_through_litellm_parser(
+    api, output_kind, stream, replacement, entity_type, *, behavior=None,
+    require_tool=False,
+):
     dictionary = replacement == "dictionary"
     corpus_case = entity_type if replacement == "dkb" else None
     guardrail = RuPIIGuardrail(
@@ -105,18 +161,51 @@ async def test_round_trip_through_litellm_parser(
     if replacement == "long-base64":
         original = "A" * 70000 + "\n    " + "B" * 70000
     expected = original
+    strict_expected = None
+    if behavior:
+        instruction, provider_template, client_template, instruction_obeyed = behavior
+        if instruction == "label":
+            original = "A" * 15000
+            entity_type = "BASE64_DATA"
+        strict_expected = {
+            "bare": original, "label": "Base64: " + original,
+            "repeat": original + " / " + original,
+        }[instruction]
+        expected = client_template.format(value=original)
     if output_kind == "code":
         if not corpus_case and replacement != "long-base64":
             original = "Т-Банк" if dictionary else "Москва"
         expected = f'let city = "{original}"\nlet path = "C:\\work"\nprint(city)\n'
-    prompt = "Верни без изменений: " + expected
+    prompt = "Верни без изменений: " + (strict_expected or expected)
     data = (
         {"messages": [{"role": "user", "content": prompt}]}
         if api == "chat"
         else {"input": prompt}
     )
     data["stream"] = stream
+    tool_options = {}
+    if require_tool:
+        function = {
+            "name": "get_city_code", "description": "Store the exact synthetic value",
+            "parameters": {
+                "type": "object", "properties": {"city": {"type": "string"}},
+                "required": ["city"], "additionalProperties": False,
+            },
+        }
+        tool_options = {
+            "tools": [{"type": "function", "function": function}]
+            if api == "chat" else [{"type": "function", **function}],
+            "tool_choice": {"type": "function", "function": {"name": "get_city_code"}}
+            if api == "chat" else {"type": "function", "name": "get_city_code"},
+        }
+        data.update(tool_options)
     entities = [] if dictionary else [_entity(prompt, original, entity_type)]
+    if behavior and instruction == "repeat":
+        start = prompt.rindex(original)
+        entities.append({
+            "entity_type": entity_type, "start": start,
+            "end": start + len(original), "score": 1.0,
+        })
     if corpus_case:
         offset = prompt.index(original)
         entities = [
@@ -138,8 +227,13 @@ async def test_round_trip_through_litellm_parser(
         provider_text = masked["messages"][0]["content"] if api == "chat" else masked["input"]
         upstream_text = provider_text[len("Верни без изменений: "):]
     else:
-        assert mapping == {provider_value: original}
+        expected_mapping = {provider_value: original}
+        if behavior and instruction == "repeat":
+            expected_mapping[f"<{entity_type}_2>"] = original
+        assert mapping == expected_mapping
         upstream_text = expected.replace(original, provider_value)
+    if behavior:
+        upstream_text = provider_template.format(value=provider_value)
     upstream_output = (
         json.dumps({"city": upstream_text})
         if output_kind == "arguments"
@@ -275,6 +369,8 @@ async def test_round_trip_through_litellm_parser(
         body = json.loads(request.content)
         requests.append(body)
         assert body.get("stream", False) is stream
+        if require_tool:
+            assert body["tool_choice"] == tool_options["tool_choice"]
         sent = body["messages"][0]["content"] if api == "chat" else body["input"]
         assert original not in sent
         assert provider_value in sent
@@ -333,6 +429,7 @@ async def test_round_trip_through_litellm_parser(
                 messages=masked["messages"],
                 stream=stream,
                 client=client,
+                **tool_options,
             )
         else:
             client = AsyncHTTPHandler()
@@ -345,6 +442,7 @@ async def test_round_trip_through_litellm_parser(
                 api_key="synthetic-test-key",
                 api_base="http://mock.invalid/v1",
                 client=client,
+                **tool_options,
             )
         if stream:
             restored = [
@@ -405,6 +503,17 @@ async def test_round_trip_through_litellm_parser(
             assert output.encode() == expected.encode()
             assert final_item["content"][0]["text"] == output
         assert final_response["status"] == "completed"
+    if behavior:
+        instruction_result = json.loads(output)["city"] if output_kind == "arguments" else output
+        assert (instruction_result.encode() == strict_expected.encode()) is instruction_obeyed
+    if require_tool:
+        if api == "chat":
+            assert not any(
+                (choice.delta if stream else choice.message).tool_calls
+                for event in restored for choice in event.choices
+            )
+        else:
+            assert not any(item["type"] == "function_call" for item in final_response["output"])
 
 
 def _entity(text, value, entity_type):
