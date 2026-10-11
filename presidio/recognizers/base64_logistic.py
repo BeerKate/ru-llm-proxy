@@ -1,6 +1,7 @@
-# Imported from user-supplied b64_bench.zip, b64_masker.py.
-# Source SHA256: a61ce83859f952c2b518db3ac5061aa1dc7b309ee3707eee69228dda432bb8ab
-# Algorithm/coefficients are preserved; reported upstream benchmark claims are unverified here.
+# Supplied Claude cascade, imported 2026-10-12 from b64_bench (1).zip.
+# Algorithm and coefficients are unchanged; integration uses find_spans.
+# Standalone mask_base64 is not the Gateway masking implementation.
+# Source SHA256: 59e2b297abfa23c11afe1076201271e0d0adbebf6625bd34e65c59bf5fa4be38
 
 """
 Маскирование base64-подстрок перед NER (BERT) в прокси перед vLLM.
@@ -10,16 +11,22 @@ base64 это или обычный токен (слово, идентифика
 
     from b64_masker import mask_base64
     masked, mapping = mask_base64(text)   # работает и на тексте сообщений, и на сыром JSON-теле
+    # одинаковые строки получают один плейсхолдер; mapping: плейсхолдер -> оригинал
 
 Каскад для токена-кандидата:
   0. Структурные «точно да»: data:...;base64,..., JWT, PEM-блоки.
-  1. Синтаксис: алфавит одного вида (std "+/" или url "-_"), корректный паддинг,
-     len(core) % 4 != 1, не hex (в т.ч. 0x...), не UUID, не только цифры,
-     не путь (src/main/java), не kebab/snake-имя (Llama-2-7b-chat-hf).
+  1. Синтаксис: алфавит одного вида (std "+/" или url "-_"), корректный паддинг, не hex (в т.ч. 0x...),
+     не UUID, не только цифры, не ID с префиксом (toolu_…, msg_…, chatcmpl-…, call_…),
+     не путь (src/main/java), не kebab/snake-имя (Llama-2-7b-chat-hf), не "//////".
+     Невалидная длина (4k+1, лишний/потерянный символ при копировании) — только от 33 символов,
+     проверяется без последнего символа.
   2. Короткая зона 8-15 символов: маскируем только base64 от ASCII/кириллического
-     текста (для 8-11 — ещё и с паддингом "="). Так ловятся YWRtaW4= (admin),
-     UEBzc3cwcmQh (P@ssw0rd!), 0JjQstCw0L0= (Иван), но не "test", "Installs", "KEY_LEFT".
+     текста, буквы или цифры (для 8-11 — ещё и с паддингом "="). Так ловятся YWRtaW4= (admin),
+     UEBzc3cwcmQh (P@ssw0rd!), 0JjQstCw0L0= (Иван), NDUxMCAxMjM0NTY (паспорт), но не "test", "KEY_LEFT".
   3. От 16 символов: декодируется в текст -> base64; много нулевых байтов -> base64.
+  3a. Явный контекст: рядом с пометкой base64 ({"encoding": "base64", "value": "…"}, "Base64: …",
+     "*_base64": "…", base64.b64decode(…)) берём и короткие литералы в кавычках, если они декодируются
+     в текст (NTA0NDU2 -> 504456); сразу после пометки — любую валидную строку с паддингом (YQ==).
   4. Иначе — логрег по 8 признакам статистики символов (randomness_score), порог зависит от длины.
   5. Длинные (>= LONG_LEN) std-токены маскируем при слабом признаке случайности (score > -3).
   Декодирование и признаки считаются по первым PREFIX символам — O(1) на любой размер блоба.
@@ -30,12 +37,13 @@ calling, k8s/Terraform, логи loghub, markdown, русские тексты):
   тексте сообщений и на сыром JSON. Случайный бинарный base64 16-23 символа — 83-93% (зона риска).
   FP на полном скане 67 млн символов: 33 вхождения (в основном идентификаторы квантования vLLM),
   т.е. ~0.5 на 1 млн символов; наивный regex [A-Za-z0-9+/]{16,} — ~1800 на 1 млн символов.
+  Тест-кейсы ИБ (19 кейсов, 17 base64-строк): 17/17, ложных масок 0 — и на тексте, и на JSON-теле.
+  Датасеты Codex (http-456 и др.): 430/433 base64, вне разметки — только неразмеченный настоящий base64.
 """
 from __future__ import annotations
 
 import base64
 import binascii
-import math
 import re
 
 MIN_LEN = 16       # минимальная длина core без паддинга для "голого" кандидата
@@ -55,6 +63,18 @@ PEM = re.compile(r"-----BEGIN [A-Z0-9 ]+-----[\s\S]+?-----END [A-Z0-9 ]+-----")
 # Граница слева: не символ алфавита (но "=" допустим — token=QUJD...),
 # справа: не символ алфавита и не "=".
 CANDIDATE = re.compile(r"(?<![A-Za-z0-9+/_-])[A-Za-z0-9+/_-]{6,}={0,2}(?![A-Za-z0-9+/_=-])")
+
+# ID агентских API: известный префикс, разделитель, случайная часть без разделителей.
+# Это идентификаторы, а не закодированные данные; маскировать их вредно — рвётся связь
+# tool_call ↔ tool_result. Список ЯВНЫЙ: общий шаблон «префикс_случайное» пропускал бы и секреты
+# того же вида (ghp_…, glpat-…, sk_live_…, npm_…). Неизвестный префикс маскируется как обычно.
+# Свои форматы ID (например, ID обращений из CRM) добавляйте в ID_PREFIXES.
+ID_PREFIXES = (
+    "call", "toolu", "srvtoolu", "msg", "req", "chatcmpl", "cmpl",           # OpenAI / Anthropic / vLLM
+    "run", "thread", "asst", "step", "file", "batch", "resp", "fc", "ftjob",  # OpenAI Assistants / Responses
+)
+PREFIXED_ID = re.compile(r"(?:%s)[_-](?:[a-z]{2,12}[_-])?[A-Za-z0-9]{12,}" % "|".join(ID_PREFIXES))
+MIN_TRIM_LEN = 33
 
 HEX = re.compile(r"(?:0[xX])?[0-9a-fA-F]+")
 UUID = re.compile(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
@@ -90,23 +110,60 @@ def _is_meaningful_text(b: bytes, truncated: bool = False) -> bool:
             return False
     if not PLAIN_TEXT.fullmatch(t):
         return False
-    # в декодированном тексте должны быть "буквенные" символы
-    letters = sum(ch.isalpha() for ch in t)
-    return letters / len(t) >= 0.4
+    # в декодированном тексте должны быть буквы или цифры (цифры — ради числовых ПДн и паролей)
+    return sum(ch.isalnum() for ch in t) / len(t) >= 0.4
 
 
 
 
-def _is_plain_text(b: bytes) -> bool:
+def _is_plain_text(b: bytes, min_len: int = 4, min_alnum: float = 0.5) -> bool:
     """Строже, чем _is_meaningful_text: для коротких токенов. Случайные байты часто
-    оказываются валидным UTF-8, но тогда это иврит/арабица/CJK, а не ASCII/кириллица."""
+    оказываются валидным UTF-8, но тогда это иврит/арабица/CJK, а не ASCII/кириллица.
+    Цифры считаются наравне с буквами: base64 от ПИН-кода, даты, номера паспорта."""
     try:
         t = b.decode("utf-8")
     except UnicodeDecodeError:
         return False
-    if len(t) < 4 or not PLAIN_TEXT.fullmatch(t):
+    if len(t) < min_len or not PLAIN_TEXT.fullmatch(t):
         return False
-    return sum(ch.isalpha() for ch in t) / len(t) >= 0.5
+    return sum(ch.isalnum() for ch in t) / len(t) >= min_alnum
+
+
+# --- явный контекст base64 ---------------------------------------------------
+# Короткий base64 (до 15 символов без паддинга) по форме неотличим от слова, но часто стоит рядом с
+# явной пометкой: "Base64: …", {"encoding": "base64", "value": "…"}, "document_base64": "…",
+# blob = "…"; base64.b64decode(blob). Рядом с пометкой берём только строковые литералы в кавычках
+# или значение сразу после пометки ("Base64: X"), если они декодируются в текст; сразу после пометки —
+# ещё и любую валидную строку с паддингом. Голые слова рядом с пометкой (encode, by) не трогаем.
+B64_MARKER = re.compile(r"(?i)base64|b64")
+IMMEDIATE_MARKER = re.compile(r"(?i)(?:base64|b64)[A-Za-z_]*[\"']?[ \t]*[:=][ \t]*[\"']?$")   # в пределах строки
+WORDLIKE = re.compile(r"[a-z]+|[A-Z]+|[a-z_-]+")   # 'encode', 'RGB', 'big_endian' — у base64 6+ символов так почти не бывает
+SHORT_CAND = re.compile(r"(?<![A-Za-z0-9+/_-])[A-Za-z0-9+/_-]{2,}={0,2}(?![A-Za-z0-9+/_=-])")
+CONTEXT_WINDOW = 60
+
+
+def _context_base64(tok: str, immediate: bool) -> bool:
+    """Токен рядом с явной пометкой base64 (проверяется вызывающим кодом).
+    immediate — пометка стоит прямо перед токеном ("Base64: X", "x_base64": "X")."""
+    core = tok.rstrip("=")
+    pad = len(tok) - len(core)
+    L = len(core)
+    if L < 2 or L % 4 == 1 or (pad and (L + pad) % 4) or B64_MARKER.search(tok):
+        return False
+    has_url = "-" in core or "_" in core
+    if has_url and ("+" in core or "/" in core):
+        return False
+    if core.isdigit() or PREFIXED_ID.fullmatch(core) or (not immediate and WORDLIKE.fullmatch(core)):
+        return False
+    decoded = _decode(core, urlsafe=has_url)
+    if decoded is None:
+        return False
+    if immediate:                         # "Base64: YQ==" -> a, "Base64: -__v-g==" (бинарь с паддингом)
+        return _is_plain_text(decoded, min_len=1) or bool(pad)
+    # литерал в кавычках рядом с пометкой: "dGI5MjAz" -> tb9203, "NTA0NDU2" -> 504456, "MDU3MA==" -> 0570.
+    # Не короче 6 символов и 4 декодированных: короткие слова в коде ('fmt', 'big5') случайно
+    # декодируются в 1-3 печатных символа.
+    return L >= 6 and _is_plain_text(decoded, min_len=4, min_alnum=0.3)   # "MiArIDIgPSA0" -> "2 + 2 = 4"
 
 
 SEGMENT = re.compile(r"[A-Z]?[a-z]+|[A-Z]+(?![a-z])|[0-9]+")  # разбиение camelCase/PascalCase
@@ -196,10 +253,17 @@ def is_base64(tok: str) -> bool:
     has_url = "-" in core or "_" in core
     if has_std and has_url:
         return False
-    if L % 4 == 1 or (pad and (L + pad) % 4):
+    if L % 4 == 1:
+        # Невалидная длина: при копировании добавился или потерялся символ (кейс ИБ: строка из 45 символов).
+        # Строгий декодер такое не примет, нестрогий примет. Проверяем без последнего символа, но только
+        # длинные токены без паддинга: на длинах до 32 это давало ложные срабатывания (call_-ID, имена vLLM).
+        return not pad and L >= MIN_TRIM_LEN and is_base64(core[:-1])
+    if pad and (L + pad) % 4:
         return False
     if core.isdigit() or HEX.fullmatch(core) or UUID.fullmatch(core):
         return False
+    if PREFIXED_ID.fullmatch(core):
+        return False                      # toolu_01…, msg_…, chatcmpl-…, call_…, req_… — ID агентских API
     if L + pad < 8:
         return False
 
@@ -210,6 +274,8 @@ def is_base64(tok: str) -> bool:
     if L >= MIN_LEN and decoded.count(0) / len(decoded) >= 0.25:
         return True                       # бинарь с нулями ("AAAA..."); проверяем ДО правила путей:
                                           # байты 0xFF дают много "/", и такой блоб похож на путь
+    if len(set(head)) <= 3:
+        return False                      # "//////", "+-+-+-" — разделители, а не данные
     if has_url and _looks_like_kebab(core):
         return False
     if has_std and _looks_like_path(core):
@@ -253,6 +319,31 @@ def find_spans(text: str) -> list[tuple[int, int]]:
         if not covered(*m.span()) and is_base64(m.group()):
             spans.append(m.span())
 
+    # контекстный проход: только окна вокруг пометок base64 (иначе на коде, где base64 упоминается часто,
+    # пришлось бы проверять каждое слово документа)
+    regions: list[list[int]] = []
+    for mk in B64_MARKER.finditer(scan):
+        a, b = max(0, mk.start() - CONTEXT_WINDOW - 100), mk.end() + CONTEXT_WINDOW + 100
+        if regions and a <= regions[-1][1]:
+            regions[-1][1] = b
+        else:
+            regions.append([a, b])
+    for ra, rb in regions:
+        for m in SHORT_CAND.finditer(scan, ra, min(rb, len(scan))):
+            s, e = m.span()
+            if any(a < e and s < b for a, b in spans):
+                continue
+            # кавычки проверяем по исходному тексту: в сыром JSON они экранированы (\"), а в scan уже пробелы
+            quoted = s > 0 and text[s - 1] in "\"'" and text[e:e + 1] in ("\"", "'", "\\")
+            before = scan[max(0, s - CONTEXT_WINDOW):s]
+            # дешёвая предпроверка перед регуляркой: пометка «сразу перед» кончается на : = или кавычку
+            immediate = before.rstrip(" \t")[-1:] in (":", "=", '"', "'") and IMMEDIATE_MARKER.search(before) is not None
+            if not (quoted or immediate):
+                continue
+            if (immediate or B64_MARKER.search(before) or B64_MARKER.search(scan[e:e + CONTEXT_WINDOW])) \
+                    and _context_base64(m.group(), immediate):
+                spans.append((s, e))
+
     # MIME-перенос (строки по 64/76): склеиваем соседние куски, разделённые только пробелами
     spans.sort()
     merged: list[list[int]] = []
@@ -274,11 +365,13 @@ def find_spans(text: str) -> list[tuple[int, int]]:
 def mask_base64(text: str, placeholder: str = "<BASE64_{i}>") -> tuple[str, dict[str, str]]:
     """Возвращает замаскированный текст и маппинг плейсхолдер -> оригинал
     (для обратной подстановки в ответ модели, если нужно)."""
-    out, mapping, last = [], {}, 0
-    for i, (s, e) in enumerate(find_spans(text), 1):
-        key = placeholder.format(i=i)
-        mapping[key] = text[s:e]
-        out += [text[last:s], key]
+    out, mapping, seen, last = [], {}, {}, 0
+    for s, e in find_spans(text):
+        val = text[s:e]
+        if val not in seen:   # одинаковые строки получают один плейсхолдер: модель видит, что это одно и то же
+            seen[val] = placeholder.format(i=len(seen) + 1)
+            mapping[seen[val]] = val
+        out += [text[last:s], seen[val]]
         last = e
     out.append(text[last:])
     return "".join(out), mapping
