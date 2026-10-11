@@ -94,17 +94,27 @@ def test_default_corpus_covers_all_target_types_and_risk_classes():
 
 def test_instruction_corpus_separates_originals_pairs_and_holdouts():
     cases = load_corpus(DEFAULT_CORPUS_PATH.with_name("instruction_regressions.jsonl"))
-    assert len(cases) == 43
+    assert len(cases) == 59
     assert sum("original" in case.tags for case in cases) == 8
     assert sum("holdout" in case.tags for case in cases) == 14
-    assert sum("negative" in case.tags for case in cases) == 28
-    assert sum(case.critical for case in cases) == 15
+    assert sum("negative" in case.tags for case in cases) == 31
+    assert sum(case.critical for case in cases) == 28
+    assert sum("instruction_login_context" in case.tags for case in cases) == 16
     assert {"PERSON", "ORGANIZATION"} <= {
         entity.entity_type
         for case in cases
         if "uppercase" in case.tags
         for entity in case.expected
     }
+
+
+def test_context_annotations_do_not_expand_mandatory_ner_targets():
+    text, expected = parse_annotated_text(
+        "Email {{EMAIL_ADDRESS:sample@example.test}}, host {{HOSTNAME:host-01}}"
+    )
+    assert [e.entity_type for e in expected] == ["EMAIL_ADDRESS", "HOSTNAME"]
+    assert [text[e.start:e.end] for e in expected] == ["sample@example.test", "host-01"]
+    assert {"EMAIL_ADDRESS", "HOSTNAME"}.isdisjoint(TARGET_ENTITY_TYPES)
 
 
 def test_name_corpus_has_explicit_scope_and_untuned_holdout():

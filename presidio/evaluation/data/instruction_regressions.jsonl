@@ -41,3 +41,19 @@
 {"id":"instruction_holdout_org","annotated_text":"Платёж подготовлен для {{ORGANIZATION:Альфа-Банка}}. Верни получателя.","critical":true,"tags":["positive","organization","holdout"]}
 {"id":"instruction_holdout_auth_token","annotated_text":"Верни AUTH_TOKEN={{AUTH_TOKEN:synthetic-session-token-2031}} без пояснений.","critical":true,"tags":["positive","auth_token","holdout"]}
 {"id":"instruction_holdout_secret_key","annotated_text":"Верни SECRET_KEY={{SECRET_KEY:synthetic-key-material-2031}} без изменений.","critical":true,"tags":["positive","secret_key","holdout"]}
+{"id":"login_instruction_reply","annotated_text":"Reply only with that email.","tags":["negative","instruction","instruction_login_context","en"]}
+{"id":"login_instruction_respond","annotated_text":"Respond only with the address.","tags":["negative","instruction","instruction_login_context","en"]}
+{"id":"login_instruction_polite","annotated_text":"Please reply only with that email.","tags":["negative","instruction","instruction_login_context","en"]}
+{"id":"login_instruction_email_original","annotated_text":"The FIRST contact email is {{EMAIL_ADDRESS:stage102-first@example.test}}. Reply only with that email.","critical":true,"tags":["positive","instruction","instruction_login_context","en"]}
+{"id":"login_instruction_email_lowercase","annotated_text":"The FIRST contact email is {{EMAIL_ADDRESS:stage102-first@example.test}}. reply only with that email.","critical":true,"tags":["positive","instruction","instruction_login_context","en"]}
+{"id":"login_instruction_email_uppercase","annotated_text":"The FIRST contact email is {{EMAIL_ADDRESS:stage102-first@example.test}}. REPLY ONLY WITH THAT EMAIL.","critical":true,"tags":["positive","instruction","instruction_login_context","en"]}
+{"id":"login_instruction_email_polite","annotated_text":"The FIRST contact email is {{EMAIL_ADDRESS:stage102-first@example.test}}. Please reply only with that email.","critical":true,"tags":["positive","instruction","instruction_login_context","en"]}
+{"id":"login_instruction_email_respond","annotated_text":"The FIRST contact email is {{EMAIL_ADDRESS:stage102-first@example.test}}. Respond only with the address.","critical":true,"tags":["positive","instruction","instruction_login_context","en"]}
+{"id":"login_instruction_email_return","annotated_text":"The FIRST contact email is {{EMAIL_ADDRESS:stage102-first@example.test}}. Return only the email address.","critical":true,"tags":["positive","instruction","instruction_login_context","en"]}
+{"id":"login_instruction_email_russian","annotated_text":"Почта {{EMAIL_ADDRESS:stage102-first@example.test}}. Верни только адрес.","critical":true,"tags":["positive","instruction","instruction_login_context","ru"]}
+{"id":"login_command_named_account","annotated_text":"login={{LOGIN:Reply}}","critical":true,"tags":["positive","login","instruction_login_context","en"]}
+{"id":"login_command_named_username","annotated_text":"username: {{LOGIN:Reply}}","critical":true,"tags":["positive","login","instruction_login_context","en"]}
+{"id":"login_command_named_json","annotated_text":"{\"username\": \"{{LOGIN:Reply}}\"}","critical":true,"tags":["positive","login","instruction_login_context","json"]}
+{"id":"login_command_named_pguser","annotated_text":"PGUSER={{LOGIN:Reply}}","critical":true,"tags":["positive","login","instruction_login_context","en"]}
+{"id":"login_command_named_ssh","annotated_text":"ssh {{LOGIN:Reply}}@{{HOSTNAME:go-i-ml-01}}","critical":true,"tags":["positive","login","instruction_login_context","en"]}
+{"id":"login_command_assignment_not_sentence","annotated_text":"login={{LOGIN:Reply}} only with that email.","critical":true,"tags":["positive","login","instruction_login_context","en"]}

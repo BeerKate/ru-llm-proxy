@@ -11,6 +11,7 @@ import pytest
 import pytest_asyncio
 from litellm.litellm_core_utils.logging_worker import GLOBAL_LOGGING_WORKER
 from litellm.llms.custom_httpx.http_handler import AsyncHTTPHandler
+from litellm.exceptions import MidStreamFallbackError
 from openai import AsyncOpenAI
 
 from litellm_guardrails.pii_guardrail import RuPIIGuardrail
@@ -42,6 +43,76 @@ class _WireStream(httpx.AsyncByteStream):
 
     async def aclose(self):
         self.closed = True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("repeat_count", [99, 102])
+@pytest.mark.parametrize("protected", [False, True])
+async def test_native_repeated_chunk_limit_is_not_success(
+    repeat_count, protected, llm_logging_lifecycle
+):
+    assert litellm.REPEATED_STREAMING_CHUNK_LIMIT == 100
+    events = [
+        {
+            "id": "repeat-stream", "object": "chat.completion.chunk",
+            "created": 1, "model": "gpt-4o-mini",
+            "choices": [{"index": 0, "delta": {"content": " " * 128},
+                         "finish_reason": None}],
+        }
+        for _ in range(repeat_count)
+    ]
+    events.append({
+        "id": "repeat-stream", "object": "chat.completion.chunk", "created": 1,
+        "model": "gpt-4o-mini",
+        "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+    })
+    wire = "".join("data: " + json.dumps(event) + "\n\n" for event in events)
+    wire += "data: [DONE]\n\n"
+    transport = _WireStream(wire.encode())
+    chunks = []
+    def provider(_request):
+        return httpx.Response(
+            200, headers={"Content-Type": "text/event-stream"}, stream=transport
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(provider)) as http_client:
+        client = AsyncOpenAI(
+            api_key="synthetic-test-key", base_url="http://mock.invalid/v1",
+            http_client=http_client,
+        )
+        response = await litellm.acompletion(
+            model="openai/gpt-4o-mini", messages=[{"role": "user", "content": "test"}],
+            stream=True, client=client,
+        )
+        if protected:
+            guardrail = RuPIIGuardrail()
+            guardrail._redis = AsyncMock()
+            guardrail._redis.get.return_value = None
+            response = guardrail.async_post_call_streaming_iterator_hook(
+                user_api_key_dict=MagicMock(), response=response,
+                request_data={
+                    "stream": True, "metadata": {},
+                    "messages": [{"role": "user", "content": "test"}],
+                },
+            )
+        # LiteLLM checks already accumulated chunks before adding the next one.
+        if repeat_count == 102:
+            with pytest.raises(
+                MidStreamFallbackError, match="repeating the same chunk"
+            ) as raised:
+                async for chunk in response:
+                    chunks.append(chunk)
+            assert isinstance(raised.value.original_exception, litellm.InternalServerError)
+            assert not any(c.finish_reason for chunk in chunks for c in chunk.choices)
+        else:
+            async for chunk in response:
+                chunks.append(chunk)
+            choices = [c for chunk in chunks for c in chunk.choices]
+            assert sum(c.finish_reason == "stop" for c in choices) == 1
+            assert "".join(c.delta.content or "" for c in choices) == " " * (128 * repeat_count)
+        await client.close()
+        await transport.aclose()
+    assert transport.closed
 
 
 @pytest.mark.asyncio
@@ -77,6 +148,10 @@ MODEL_RESPONSE_CASES = [
         id="marker-in-explanation",
     ),
     pytest.param("bare", "<email_address_1>", "<email_address_1>", False, id="changed-marker"),
+    pytest.param(
+        "bare", "&lt;EMAIL_ADDRESS_1&gt;", "&lt;EMAIL_ADDRESS_1&gt;", False,
+        id="html-escaped-marker",
+    ),
     pytest.param("bare", "Метка удалена.", "Метка удалена.", False, id="deleted-marker"),
     pytest.param("bare", "<EMAIL_ADDRESS_99>", "<EMAIL_ADDRESS_99>", False, id="unknown-marker"),
     pytest.param("repeat", "{value} / {value}", "{value} / {value}", True, id="repeated-marker"),

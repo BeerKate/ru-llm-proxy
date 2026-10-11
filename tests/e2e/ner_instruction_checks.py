@@ -170,7 +170,7 @@ def check_entity_filters(analyzer_url):
     return len(cases) + len(examples)
 
 
-def check_instructions(analyzer_url, proxy_url, capture_url):
+def check_instructions(analyzer_url, proxy_url, block_proxy_url, capture_url):
     entity_filter_cases = check_entity_filters(analyzer_url)
     cases = load_corpus(CORPUS)
     client = AnalyzerClient(analyzer_url, timeout_seconds=60)
@@ -178,6 +178,28 @@ def check_instructions(analyzer_url, proxy_url, capture_url):
     metrics = evaluate_predictions(cases, predictions)
     for case in cases:
         results = predictions[case.case_id]
+        if "instruction_login_context" in case.tags:
+            expected_spans = {(e.entity_type, e.start, e.end) for e in case.expected}
+            assert {
+                (r["entity_type"], r["start"], r["end"]) for r in results
+            } == expected_spans, f"{case.case_id}: command or credential changed"
+            filtered = _request(
+                analyzer_url, "/api/v1/analyze",
+                {"text": case.text, "entities": ["LOGIN"], "score_threshold": 0.35},
+            )["entities"]
+            filtered_spans = {
+                (r["entity_type"], r["start"], r["end"]) for r in filtered
+            }
+            # A selective filter can expose a different BERT type for an email
+            # or hostname. Preserve that accepted limitation, never the command.
+            assert {span for span in expected_spans if span[0] == "LOGIN"} <= filtered_spans
+            assert all(
+                r["entity_type"] == "LOGIN"
+                and any(e.start <= r["start"] < r["end"] <= e.end for e in case.expected)
+                for r in filtered
+            ), (
+                f"{case.case_id}: LOGIN filter changed command or credential"
+            )
         if not case.expected:
             assert not results, f"{case.case_id}: unexpected masking"
         for expected in case.expected:
@@ -188,6 +210,7 @@ def check_instructions(analyzer_url, proxy_url, capture_url):
     assert metrics["aggregate"]["critical_coverage_recall"] == 1.0
 
     flows = 0
+    login_block_flows = 0
     for case in cases:
         for api in ("chat/completions", "responses"):
             for stream in (False, True):
@@ -216,6 +239,23 @@ def check_instructions(analyzer_url, proxy_url, capture_url):
                 ], f"{case.case_id}: sensitive egress"
                 assert capture["provider_saw_pii_placeholder"] == bool(case.expected)
                 flows += 1
+                if "instruction_login_context" not in case.tags:
+                    continue
+                _request(capture_url, "/capture/reset", {})
+                if case.expected:
+                    try:
+                        _request(block_proxy_url, "/v1/" + api, payload, stream=stream)
+                    except urllib.error.HTTPError as error:
+                        assert error.code == 422, f"{case.case_id}: unexpected block status"
+                    else:
+                        raise AssertionError(f"{case.case_id}: sensitive input not blocked")
+                else:
+                    response = _request(block_proxy_url, "/v1/" + api, payload, stream=stream)
+                    assert _restored_text(response, api, stream) == case.text
+                with urllib.request.urlopen(capture_url + "/capture", timeout=5) as captured:
+                    capture = json.load(captured)
+                assert capture["provider_requests"] == (0 if case.expected else 1)
+                login_block_flows += 1
     print(
         json.dumps(
             {
@@ -223,6 +263,7 @@ def check_instructions(analyzer_url, proxy_url, capture_url):
                 "analyzer_cases": len(cases),
                 "entity_filter_cases": entity_filter_cases,
                 "echo_flows": flows,
+                "login_block_flows": login_block_flows,
                 "holdout_cases": sum("holdout" in case.tags for case in cases),
                 "metrics": metrics["aggregate"],
             },
@@ -380,7 +421,7 @@ def main():
         (args.analyzer_url, args.proxy_url, args.block_proxy_url, args.capture_url)
     ):
         parser.error("Analyzer, mask/block proxy and capture URLs are required")
-    check_instructions(args.analyzer_url, args.proxy_url, args.capture_url)
+    check_instructions(args.analyzer_url, args.proxy_url, args.block_proxy_url, args.capture_url)
     check_names(
         args.analyzer_url, args.proxy_url, args.block_proxy_url, args.capture_url
     )
