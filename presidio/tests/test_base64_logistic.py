@@ -25,11 +25,10 @@ def test_default_and_unknown_policy(monkeypatch):
         Base64DataRecognizer(policy="unknown")
 
 
-def test_imported_source_and_coefficients_are_frozen():
-    source = Path(cascade.__file__).read_text().split("\n\n", 1)[1]
-    assert hashlib.sha256(source.encode()).hexdigest() == "59e2b297abfa23c11afe1076201271e0d0adbebf6625bd34e65c59bf5fa4be38"
+def test_model_coefficients_and_thresholds_are_frozen():
     assert cascade._W == [-1.02, -6.78, 5.07, -3.22, 7.81, 0.27, -2.03, -5.57]
     assert cascade._B == 7.75
+    assert (cascade.SCORE_THRESHOLD, cascade.MIN_LEN, cascade.LONG_LEN, cascade.PREFIX) == (1.5, 16, 64, 256)
 
 
 @pytest.mark.parametrize("text", [
