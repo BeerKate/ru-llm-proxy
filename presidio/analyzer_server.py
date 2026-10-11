@@ -293,6 +293,7 @@ ANALYSIS_SIGNATURE_ENV_NAMES = (
     "PRESIDIO_ANALYZER_DETECT_BARE_INN_BY_CHECKSUM",
     "PRESIDIO_ANALYZER_DETECT_PUBLIC_IPS",
     "PRESIDIO_ANALYZER_INTERNAL_DOMAIN_SUFFIXES",
+    "PRESIDIO_ANALYZER_BASE64_POLICY",
 )
 ANALYSIS_SIGNATURE_DISTRIBUTIONS = (
     "presidio-analyzer",
@@ -969,7 +970,7 @@ def _raise_if_cancelled(cancellation_event: threading.Event | None) -> None:
 
 
 def _analyze_document_base64(request: AnalyzeRequest) -> list[RecognizerResult]:
-    """Resolve declared spans only through the configured language registry."""
+    """Resolve complete Base64 spans through the configured language registry."""
     results = []
     registry = getattr(analyzer, "registry", None)
     for recognizer in getattr(registry, "recognizers", ()):
@@ -980,7 +981,7 @@ def _analyze_document_base64(request: AnalyzeRequest) -> list[RecognizerResult]:
         ):
             # Keep excluded typed spans until merge applies the request filter;
             # their fragments must not be reinterpreted as untyped Base64.
-            results.extend(recognizer.analyze_declared(request.text, recognizer.supported_entities))
+            results.extend(recognizer.analyze_document(request.text, recognizer.supported_entities))
     return results
 
 

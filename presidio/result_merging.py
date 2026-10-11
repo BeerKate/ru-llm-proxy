@@ -249,6 +249,10 @@ def merge_results(
     contract_evidence = contract_context_evidence(text)
     reference_spans = []
     results = list(results)
+    # The experimental cascade adds coverage; it must never compete with native
+    # credential or NER findings for ownership of their existing ranges.
+    logistic_results = [r for r in results if _is_logistic_base64(r)]
+    results = [r for r in results if not _is_logistic_base64(r)]
     if any(detection_source(r) == SOURCE_NER and r.entity_type in _CREDENTIAL_ENTITY_TYPES for r in results):
         from recognizers.credential_rules import credential_reference_spans
         reference_spans = credential_reference_spans(text)
@@ -398,7 +402,64 @@ def merge_results(
         )
 
     kept.sort(key=lambda result: (result.start, result.end, result.entity_type))
+    if logistic_results:
+        kept, added_decisions = _add_logistic_coverage(
+            text, kept, logistic_results, requested_entities, score_threshold
+        )
+        decisions.extend(added_decisions)
     return MergeOutcome(tuple(kept), tuple(decisions))
+
+
+def _is_logistic_base64(result: RecognizerResult) -> bool:
+    return (
+        result.entity_type == "BASE64_DATA"
+        and (result.recognition_metadata or {}).get("deterministic_rule_id")
+        == "base64.logistic-cascade"
+    )
+
+
+def _add_logistic_coverage(text, native, candidates, requested_entities, score_threshold):
+    """Union new Base64 ranges and subtract retained native spans in a sweep.
+
+    Native results and types are unchanged. An intersecting container can need
+    several placeholders, whose saved values still restore the original text.
+    """
+    if requested_entities and "BASE64_DATA" not in requested_entities:
+        return native, []
+    ordered = sorted(
+        (r for r in candidates if _valid_span(r, len(text)) and r.score >= score_threshold),
+        key=lambda r: (r.start, r.end),
+    )
+    unions = []
+    for result in ordered:
+        if unions and result.start <= unions[-1].end:
+            previous = unions[-1]
+            unions[-1] = _copy_name(
+                previous, end=max(previous.end, result.end),
+                score=max(previous.score, result.score),
+            )
+        else:
+            unions.append(result)
+    additions = []
+    decisions = []
+    native_index = 0
+    for result in unions:
+        cursor = result.start
+        while native_index < len(native) and native[native_index].end <= cursor:
+            native_index += 1
+        index = native_index
+        while index < len(native) and native[index].start < result.end:
+            existing = native[index]
+            if existing.start > cursor:
+                additions.append(_copy_name(result, start=cursor, end=existing.start))
+            cursor = max(cursor, existing.end)
+            decisions.append(MergeDecision(
+                "base64_logistic_native_preserved", detection_source(existing), SOURCE_STRUCTURAL
+            ))
+            index += 1
+        if cursor < result.end:
+            additions.append(_copy_name(result, start=cursor))
+    return sorted([*native, *additions], key=lambda r: (r.start, r.end, r.entity_type)), decisions
 
 
 def _copy_name(

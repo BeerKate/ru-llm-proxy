@@ -1,7 +1,8 @@
-"""Context-first Base64 detection with bounded, one-level content inspection."""
+"""Native Base64 declarations with selectable content or logistic detection."""
 
 import base64
 import binascii
+import os
 import re
 
 from presidio_analyzer import EntityRecognizer, RecognizerResult
@@ -12,6 +13,16 @@ from result_merging import DETECTION_SOURCE_METADATA_KEY, SOURCE_STRUCTURAL
 MAX_CANDIDATE_CHARS = 16384
 MAX_DECODED_BYTES = 65536
 MAX_CANDIDATES = 64
+POLICY_ENV = "PRESIDIO_ANALYZER_BASE64_POLICY"
+
+
+def load_policy(environ=None):
+    env = os.environ if environ is None else environ
+    policy = env.get(POLICY_ENV, "content").strip().lower() or "content"
+    if policy not in {"content", "logistic"}:
+        raise ValueError(f"{POLICY_ENV} must be content or logistic")
+    return policy
+
 _KEY = r"(?:base64|b64|[A-Za-z][A-Za-z0-9_.-]{0,80}[_-](?:base64|b64))"
 _CONTEXT = re.compile(
     rf"(?i)(?<![\w.-])[\"']?(?P<key>{_KEY})[\"']?[ \t]*[:=][ \t]*"
@@ -46,19 +57,20 @@ def decode_candidate(value):
 
 
 class Base64DataRecognizer(EntityRecognizer):
-    """Mask declared encodings; infer undeclared ones only from sensitive content."""
+    """Preserve declared spans and select the undeclared-candidate policy."""
 
-    def __init__(self, supported_language="ru"):
+    def __init__(self, supported_language="ru", policy=None):
         super().__init__(
             supported_entities=["BASE64_DATA", "LOGIN", "PASSWORD", "AUTH_TOKEN", "SECRET_KEY"],
             supported_language=supported_language,
             name="Base64DataRecognizer",
-            version="1.0.0",
+            version="1.1.0",
         )
+        self.policy = load_policy() if policy is None else load_policy({POLICY_ENV: policy})
         # Lazy import avoids registry cycles and never includes this recognizer or NER.
         from recognizers import PLAIN_RECOGNIZERS
         self._content_recognizers = [
-            cls() for cls in PLAIN_RECOGNIZERS
+            cls() for cls in PLAIN_RECOGNIZERS if self.policy == "content"
         ]
         from recognizers.credential_rules import (
             AuthTokenRecognizer, LoginRecognizer, PasswordRecognizer, SecretKeyRecognizer,
@@ -75,6 +87,17 @@ class Base64DataRecognizer(EntityRecognizer):
         declared_results = self.analyze_declared(text, self.supported_entities)
         results = [r for r in declared_results if r.entity_type in requested]
         declared = [(r.start, r.end) for r in declared_results]
+
+        if self.policy == "logistic":
+            if "BASE64_DATA" in requested:
+                from recognizers.base64_logistic import find_spans
+
+                for start, end in find_spans(text):
+                    # Native declarations keep their complete span and credential type.
+                    if any(a <= start and end <= b for a, b in declared):
+                        continue
+                    results.append(self._result(start, end, "base64.logistic-cascade"))
+            return EntityRecognizer.remove_duplicates(results)
 
         attempts = 0
         decoded_bytes = 0
@@ -125,6 +148,12 @@ class Base64DataRecognizer(EntityRecognizer):
                 if entity_type in requested:
                     results.append(self._result(start, end, "base64.declared", entity_type))
         return results
+
+    def analyze_document(self, text, entities):
+        """Resolve complete source containers before overlapping chunk scans."""
+        if self.policy == "logistic":
+            return self.analyze(text, entities)
+        return self.analyze_declared(text, entities)
 
     def _has_sensitive_content(self, text):
         for recognizer in self._content_recognizers:
