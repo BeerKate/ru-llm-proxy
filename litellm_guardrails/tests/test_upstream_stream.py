@@ -269,6 +269,177 @@ async def test_preconfigured_responses_client_is_copied_not_mutated(manager):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["complete", "length", "eof", "partial", "done-only", "error", "cancel"])
+async def test_stock_responses_to_chat_bridge_protects_inner_chat_transport(
+    manager, monkeypatch, mode,
+):
+    value, wires, requests = manager
+    value.test_mode = mode
+    calls = []
+    original = upstream.adapter.async_pre_call_deployment_hook
+
+    async def observe(kwargs, call_type):
+        calls.append((getattr(call_type, "value", call_type),
+                      kwargs.get("use_chat_completions_api"),
+                      type(kwargs.get("client")).__name__))
+        return await original(kwargs, call_type)
+
+    monkeypatch.setattr(upstream.adapter, "async_pre_call_deployment_hook", observe)
+    before = litellm.callbacks
+    litellm.callbacks = [upstream.adapter]
+    router = litellm.Router(model_list=[{"model_name": "test", "litellm_params": {
+        "model": "openai/mock-chat", "api_base": "http://test.invalid/v1",
+        "api_key": "synthetic-test", "max_retries": 0,
+        "use_chat_completions_api": True,
+        "extra_headers": {"X-Account": "synthetic-bridge-account"},
+        "ssl_verify": True,
+    }}], num_retries=0, timeout=3)
+    events, error = [], None
+    try:
+        try:
+            stream = await router.aresponses(
+                model="test", input="safe", stream=True,
+                timeout=9,
+                litellm_metadata={upstream.TRANSPORT_ID: "bridge-server-id"},
+            )
+            if mode != "cancel":
+                async for event in stream:
+                    events.append(event.model_dump())
+            await stream.aclose()
+        except Exception as failure:
+            error = failure
+        finally:
+            await value.close_request("bridge-server-id")
+        assert calls[0][:2] == ("aresponses", True)
+        assert calls[-1][0] == "acompletion"
+        assert calls[-1][2] == "NoneType"
+        assert len(requests) == 1 and requests[0].url.path == "/v1/chat/completions"
+        assert requests[0].headers["X-Account"] == "synthetic-bridge-account"
+        assert requests[0].headers["authorization"] == "Bearer synthetic-test"
+        assert requests[0].extensions["timeout"]["read"] == 9
+        assert upstream.TRANSPORT_ID not in requests[0].content.decode()
+        assert value.pools
+        assert all(isinstance(pool.verify, ssl.SSLContext) and pool.verify.check_hostname
+                   and pool.verify.verify_mode == ssl.CERT_REQUIRED for pool in value.pools.values())
+        assert wires and all(wire.closed == 1 for wire in wires)
+        assert not value.requests
+        assert all(pool.borrowers == 0 for pool in value.pools.values())
+        if mode in {"eof", "partial", "done-only", "error"}:
+            assert error
+            assert not any(event["type"] == "response.completed" for event in events)
+        else:
+            assert not error
+            if mode != "cancel":
+                # The stock bridge maps a real Chat length finish to completed too.
+                # This proves terminal transport evidence, not an untruncated answer.
+                assert events[-1]["type"] == "response.completed"
+                assert events[-1]["response"]["status"] == ("incomplete" if mode == "length" else "completed")
+    finally:
+        await value.close_request("bridge-server-id")
+        litellm.callbacks = before
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["complete", "length", "eof", "partial", "error"])
+@pytest.mark.parametrize("mapping", [{}, {"<PHONE_NUMBER_1>": "restored-value"}])
+async def test_stock_responses_bridge_guardrail_normalizes_only_real_terminal_events(manager, mode, mapping):
+    value, wires, _ = manager
+    value.test_mode = mode
+    before = litellm.callbacks
+    litellm.callbacks = [upstream.adapter]
+    router = litellm.Router(model_list=[{"model_name": "test", "litellm_params": {
+        "model": "openai/mock-chat", "api_base": "http://test.invalid/v1",
+        "api_key": "synthetic-test", "max_retries": 0,
+        "use_chat_completions_api": True,
+    }}], num_retries=0)
+    guard = RuPIIGuardrail()
+    guard._load_mapping = AsyncMock(return_value=mapping)
+    guard._delete_mapping = AsyncMock()
+    request_data = {"metadata": {"pii_request_id": "test-request"},
+                    "litellm_metadata": {upstream.TRANSPORT_ID: "bridge-server-id"}}
+    events = []
+    try:
+        stream = await router.aresponses(model="test", input="safe", stream=True,
+            litellm_metadata=request_data["litellm_metadata"])
+        protected = guard.async_post_call_streaming_iterator_hook(MagicMock(), stream, request_data)
+        if mode in {"eof", "partial", "error"}:
+            with pytest.raises(Exception):
+                async for event in protected:
+                    events.append(event.model_dump())
+            assert not any(event["type"] in {"response.completed", "response.incomplete"} for event in events)
+        else:
+            events = [event.model_dump() async for event in protected]
+            kind = "incomplete" if mode == "length" else "completed"
+            assert events[-1]["type"] == "response." + kind
+            assert events[-1]["response"]["status"] == kind
+            text = "".join(event.get("delta", "") for event in events if event["type"] == "response.output_text.delta")
+            assert text == ("safe restored-value" if mapping else "safe <PHONE_NUMBER_1>")
+        numbers = [event["sequence_number"] for event in events]
+        assert numbers == sorted(set(numbers))
+        assert all(wire.closed == 1 for wire in wires)
+        assert not value.requests and all(pool.borrowers == 0 for pool in value.pools.values())
+        if mapping:
+            guard._delete_mapping.assert_awaited_once_with("test-request")
+        else:
+            guard._delete_mapping.assert_not_awaited()
+    finally:
+        await value.close_request("bridge-server-id")
+        litellm.callbacks = before
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("by_prefix", [False, True])
+async def test_bridge_history_is_rejected_before_provider(manager, stream, by_prefix, caplog):
+    value, wires, requests = manager
+    kwargs = {
+        "model": "openai/chat_completions/mock-chat" if by_prefix else "openai/mock-chat",
+        "stream": stream, "previous_response_id": "PRIVATE_RESPONSE_ID",
+        "input": "PRIVATE_INPUT", "litellm_metadata": {upstream.TRANSPORT_ID: "server-id"},
+    }
+    if not by_prefix:
+        kwargs["use_chat_completions_api"] = True
+    with pytest.raises(litellm.BadRequestError) as failure:
+        await upstream.adapter.async_pre_call_deployment_hook(kwargs, "aresponses")
+    assert failure.value.status_code == 400
+    assert failure.value.code == "responses_chat_bridge_history_unsupported"
+    assert failure.value.param == "previous_response_id"
+    assert not requests and not wires and not value.pools and not value.requests
+    assert "PRIVATE_RESPONSE_ID" not in str(failure.value) + caplog.text
+    assert "PRIVATE_INPUT" not in str(failure.value) + caplog.text
+
+
+@pytest.mark.asyncio
+async def test_bridge_named_stream_tool_is_rejected_without_changing_choice(manager):
+    value, wires, requests = manager
+    choice = {"type": "function", "name": "PRIVATE_FUNCTION"}
+    kwargs = {"model": "openai/mock-chat", "stream": True,
+              "use_chat_completions_api": True, "tool_choice": choice}
+    with pytest.raises(litellm.BadRequestError) as failure:
+        await upstream.adapter.async_pre_call_deployment_hook(kwargs, "aresponses")
+    assert failure.value.status_code == 400
+    assert failure.value.code == "responses_chat_bridge_named_tool_unsupported"
+    assert failure.value.param == "tool_choice"
+    assert kwargs["tool_choice"] is choice
+    assert "PRIVATE_FUNCTION" not in str(failure.value)
+    assert not requests and not wires and not value.pools and not value.requests
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stream,choice", [
+    (False, {"type": "function", "name": "named"}),
+    (True, "auto"), (True, "none"), (True, "required"), (True, None),
+])
+async def test_supported_bridge_options_leave_outer_client_unchanged(manager, stream, choice):
+    value, _, requests = manager
+    kwargs = {"model": "mock-chat", "custom_llm_provider": "openai", "stream": stream,
+              "use_chat_completions_api": True, "tool_choice": choice}
+    assert await upstream.adapter.async_pre_call_deployment_hook(kwargs, "aresponses") is kwargs
+    assert kwargs["tool_choice"] == choice
+    assert "client" not in kwargs and not value.pools and not requests
+
+
+@pytest.mark.asyncio
 async def test_nonstream_and_other_providers_do_not_get_custom_clients(manager):
     value, _, _ = manager
     for kwargs, kind in [({"model": "openai/test", "stream": False}, "acompletion"),

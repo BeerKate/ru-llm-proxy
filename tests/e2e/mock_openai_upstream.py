@@ -303,6 +303,63 @@ class Handler(BaseHTTPRequestHandler):
                 time.sleep(hold_after_first)
         self.close_connection = True
 
+    def _write_chat_bridge_echo(self, payload):
+        values = list(dict.fromkeys(
+            match.group() for text in _iter_strings(payload.get("messages", []))
+            for match in PII_PLACEHOLDER_PATTERN.finditer(text)
+        ))
+        if not values and _text_contains(payload, "BRIDGE_CLEAN"):
+            values = ["safe-bridge-value"]
+        text = " / ".join(values)
+        tools = payload.get("tools") or []
+        tool = tools[0]["function"] if tools else None
+        arguments = json.dumps({"values": values})
+        reasoning = "checking " + text if _text_contains(payload, "BRIDGE_REASONING") else None
+        length = _text_contains(payload, "BRIDGE_LENGTH")
+        if _text_contains(payload, "BRIDGE_PARTIAL_MARKER"):
+            text = values[0][:-3]
+            arguments = '{"values":["' + text
+        elif _text_contains(payload, "BRIDGE_PARTIAL_JSON"):
+            arguments = '{"values":["' + values[0] + '"'
+        created = int(time.time())
+        base = {"id": "chatcmpl-bridge-" + uuid.uuid4().hex, "created": created, "model": "mock-chat"}
+        finish = "length" if length else "tool_calls" if tool else "stop"
+        if not payload.get("stream"):
+            message = {"role": "assistant", "content": None if tool else text}
+            if reasoning is not None:
+                message["reasoning_content"] = reasoning
+            if tool:
+                message["tool_calls"] = [{"id": "call_bridge", "type": "function", "function": {
+                    "name": tool["name"], "arguments": arguments,
+                }}]
+            self._write_json(200, {**base, "object": "chat.completion",
+                "choices": [{"index": 0, "message": message, "finish_reason": finish}],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}})
+            return
+        deltas = [{"role": "assistant"}]
+        if reasoning is not None:
+            deltas.extend({"reasoning_content": reasoning[start:start + 3]}
+                          for start in range(0, len(reasoning), 3))
+        if tool:
+            deltas.append({"tool_calls": [{"index": 0, "id": "call_bridge", "type": "function",
+                "function": {"name": tool["name"], "arguments": ""}}]})
+        # Split markers as well as JSON escapes at the upstream wire boundary.
+        content = arguments if tool else text
+        for start in range(0, len(content), 3):
+            piece = content[start:start + 3]
+            deltas.append({"tool_calls": [{"index": 0, "function": {"arguments": piece}}]}
+                          if tool else {"content": piece})
+        events = [("", {**base, "object": "chat.completion.chunk", "choices": [{
+            "index": 0, "delta": delta, "finish_reason": None,
+        }]}) for delta in deltas]
+        events.extend([
+            ("", {**base, "object": "chat.completion.chunk", "choices": [{
+                "index": 0, "delta": {}, "finish_reason": finish,
+            }]}),
+            ("", "[DONE]"),
+        ])
+        self._write_sse(events)
+
     def do_GET(self):
         if self.path == "/control/requests":
             with CAPTURE_LOCK:
@@ -422,6 +479,9 @@ class Handler(BaseHTTPRequestHandler):
 
         if self.path == "/v1/chat/completions":
             _record_provider_payload(self.path, payload)
+            if _text_contains(payload, "STOCK_BRIDGE_ECHO"):
+                self._write_chat_bridge_echo(payload)
+                return
             if not self._controlled_wait(payload):
                 return
             if payload.get("stream") is True and _text_contains(payload, "SSE_CONTROLLED"):

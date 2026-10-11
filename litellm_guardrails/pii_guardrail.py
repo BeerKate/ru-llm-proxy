@@ -30,6 +30,7 @@ from litellm_guardrails.dictionary_policy import (
     DictionarySubstitutionResult,
 )
 from litellm_guardrails.streaming_restoration import (
+    ResponsesStreamNormalizer,
     StreamingResponseRestorer,
     restore_arguments,
     restore_text,
@@ -4319,6 +4320,7 @@ class RuPIIGuardrail(CustomGuardrail):
         request_id = self._get_response_request_id(request_data)
         iterator = response.__aiter__()
         restorer = None
+        normalizer = ResponsesStreamNormalizer()
         mapping = {}
         cleanup_mapping = bool(request_id)
         try:
@@ -4348,7 +4350,9 @@ class RuPIIGuardrail(CustomGuardrail):
                         self._mark_streaming_restoration_done(request_data)
             async for item in iterator:
                 assert_request_stream_valid(request_data)
+                item = normalizer.prepare(item)
                 for restored_item in restorer.process(item) if restorer else [item]:
+                    normalizer.stamp(restored_item)
                     if self._get_container_field(restored_item, "type") == "response.completed":
                         completed = self._get_container_field(restored_item, "response")
                         if self._responses_state_context(request_data) and self._get_container_field(completed, "status") != "completed":

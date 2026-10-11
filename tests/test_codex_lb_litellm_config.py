@@ -48,6 +48,7 @@ def test_codex_lb_profile_adds_explicit_openai_compatible_public_models():
             "api_base": "http://codex-lb:2455/v1",
             "api_key": "os.environ/CODEX_LB_API_KEY",
         }
+        assert "use_chat_completions_api" not in deployment["litellm_params"]
         assert deployment["model_info"]["base_model"] == model_name
         assert deployment["model_info"]["id"] == (
             f"openai-{model_name.replace('.', '-')}-codex-lb"

@@ -6,6 +6,7 @@ model_list:
       model: openai/glm-5.3-flash
       api_base: https://api.z.ai/api/coding/paas/v4
       api_key: os.environ/ZAI_API_KEY
+      use_chat_completions_api: true
     model_info:
       id: glm-5-3-flash-zai-coding-primary
       base_model: glm-5.3-flash
@@ -15,6 +16,7 @@ model_list:
       model: openai/glm-5.3-flash
       api_base: https://api.z.ai/api/coding/paas/v4
       api_key: os.environ/ZAI_API_KEY_2
+      use_chat_completions_api: true
     model_info:
       id: glm-5-3-flash-zai-coding-secondary
       base_model: glm-5.3-flash
@@ -26,6 +28,7 @@ model_list:
       model: openai/glm-5.3
       api_base: https://api.z.ai/api/coding/paas/v4
       api_key: os.environ/ZAI_API_KEY
+      use_chat_completions_api: true
     model_info:
       id: glm-5-3-zai-coding-primary
       base_model: glm-5.3
@@ -35,6 +38,7 @@ model_list:
       model: openai/glm-5.3
       api_base: https://api.z.ai/api/coding/paas/v4
       api_key: os.environ/ZAI_API_KEY_2
+      use_chat_completions_api: true
     model_info:
       id: glm-5-3-zai-coding-secondary
       base_model: glm-5.3

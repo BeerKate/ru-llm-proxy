@@ -21,6 +21,7 @@ def test_glm_models_each_use_two_coding_plan_credentials(model):
             "model": f"openai/{model}",
             "api_base": "https://api.z.ai/api/coding/paas/v4",
             "api_key": f"os.environ/{key}",
+            "use_chat_completions_api": True,
         }
         assert deployment["model_info"] == {
             "id": f"{model.replace('.', '-')}-zai-coding-{suffix}",

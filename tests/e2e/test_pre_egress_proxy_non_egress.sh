@@ -575,4 +575,8 @@ if [ "$(cat "$tmp_dir/history-cleanup.txt")" != "[]" ]; then
     exit 1
 fi
 
+reset_capture
+docker compose -p "$PROJECT_NAME" -f "$COMPOSE_FILE" exec -T litellm \
+    python /workspace/tests/e2e/check_responses_chat_bridge.py
+
 echo "pre-egress proxy non-egress smoke passed"

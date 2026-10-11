@@ -13,6 +13,7 @@ from litellm.litellm_core_utils.logging_worker import GLOBAL_LOGGING_WORKER
 from litellm.llms.custom_httpx.http_handler import AsyncHTTPHandler
 from litellm.exceptions import MidStreamFallbackError
 from openai import AsyncOpenAI
+from pydantic import ValidationError
 
 from litellm_guardrails.pii_guardrail import RuPIIGuardrail
 from presidio.entity_types import SUPPORTED_ENTITY_TYPES
@@ -189,10 +190,132 @@ async def test_model_tool_refusal_is_not_a_successful_tool_call(
     )
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("output_kind", ["text", "arguments"])
+@pytest.mark.parametrize("replacement,entity_type", [
+    ("pii", "EMAIL_ADDRESS"), ("pii", "BASE64_DATA"),
+    ("dictionary", None), ("long-base64", "BASE64_DATA"),
+])
+async def test_stock_responses_chat_bridge_preserves_restoration(
+    stream, output_kind, replacement, entity_type, llm_logging_lifecycle,
+):
+    await _round_trip_through_litellm_parser(
+        "responses", output_kind, stream, replacement, entity_type, bridge=True,
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("output_kind", ["text", "arguments"])
+@pytest.mark.parametrize(
+    "instruction,provider_template,client_template,instruction_obeyed",
+    MODEL_RESPONSE_CASES,
+)
+async def test_stock_responses_chat_bridge_does_not_guess_model_output(
+    stream, output_kind, instruction, provider_template, client_template,
+    instruction_obeyed, llm_logging_lifecycle,
+):
+    await _round_trip_through_litellm_parser(
+        "responses", output_kind, stream, "behavior", "EMAIL_ADDRESS", bridge=True,
+        behavior=(instruction, provider_template, client_template, instruction_obeyed),
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stream", [False, True])
+async def test_stock_responses_chat_bridge_keeps_tool_refusal(
+    stream, llm_logging_lifecycle,
+):
+    explanation = "Это шаблон: {value}. Пришлите настоящий адрес."
+    call = _round_trip_through_litellm_parser(
+        "responses", "text", stream, "behavior", "EMAIL_ADDRESS", bridge=True,
+        behavior=("bare", explanation, explanation, False), require_tool=True,
+    )
+    if stream:
+        # LiteLLM 1.98.0 puts Chat-shaped tool_choice into response.created.
+        # Record the platform limitation, not a successful tool invocation.
+        with pytest.raises(ValidationError) as failure:
+            await call
+        assert all(error["loc"][0] == "tool_choice" for error in failure.value.errors())
+    else:
+        await call
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stream", [False, True])
+async def test_stock_responses_chat_bridge_keeps_required_tool_refusal(
+    stream, llm_logging_lifecycle,
+):
+    explanation = "Это шаблон: {value}. Пришлите настоящий адрес."
+    await _round_trip_through_litellm_parser(
+        "responses", "text", stream, "behavior", "EMAIL_ADDRESS", bridge=True,
+        behavior=("bare", explanation, explanation, False), require_tool=True,
+        required_tool_choice=True,
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("full_history", [False, True])
+async def test_stock_responses_chat_bridge_history_without_persisted_history(
+    full_history, llm_logging_lifecycle,
+):
+    first_text = "First turn: <EMAIL_ADDRESS_1>"
+    next_text = "Return the contact from the first turn."
+    requests = []
+
+    def provider(request):
+        assert request.url.path == "/v1/chat/completions"
+        requests.append(json.loads(request.content))
+        return httpx.Response(200, json={
+            "id": "chat-history", "object": "chat.completion", "created": 1,
+            "model": "gpt-4o-mini", "choices": [{
+                "index": 0, "message": {"role": "assistant", "content": "ok"},
+                "finish_reason": "stop",
+            }],
+        })
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(provider)) as http_client:
+        client = AsyncOpenAI(
+            api_key="synthetic-test-key", base_url="http://mock.invalid/v1",
+            http_client=http_client,
+        )
+        options = {
+            "model": "openai/gpt-4o-mini", "client": client,
+            "api_key": "synthetic-test-key", "api_base": "http://mock.invalid/v1",
+            "use_chat_completions_api": True,
+        }
+        with patch(
+            "litellm.responses.litellm_completion_transformation.session_handler."
+            "ResponsesSessionHandler.get_all_spend_logs_for_previous_response_id",
+            new=AsyncMock(return_value=[]),
+        ):
+            first = await litellm.aresponses(input=first_text, **options)
+            input_items = [
+                {"role": "user", "content": first_text},
+                {"role": "assistant", "content": "ok"},
+                {"role": "user", "content": next_text},
+            ]
+            second = await litellm.aresponses(
+                input=input_items if full_history else next_text,
+                **({} if full_history else {"previous_response_id": first.id}),
+                **options,
+            )
+    assert second.status == "completed"
+    assert len(requests) == 2
+    if full_history:
+        assert requests[1]["messages"] == input_items
+    else:
+        # No history is recovered, yet LiteLLM accepts the continuation.
+        assert requests[1]["messages"] == [{"role": "user", "content": next_text}]
+        assert first_text not in json.dumps(requests[1])
+
+
 async def _round_trip_through_litellm_parser(
     api, output_kind, stream, replacement, entity_type, *, behavior=None,
-    require_tool=False,
+    require_tool=False, bridge=False, required_tool_choice=False,
 ):
+    provider_api = "chat" if bridge else api
     dictionary = replacement == "dictionary"
     corpus_case = entity_type if replacement == "dkb" else None
     guardrail = RuPIIGuardrail(
@@ -273,6 +396,8 @@ async def _round_trip_through_litellm_parser(
             "tool_choice": {"type": "function", "function": {"name": "get_city_code"}}
             if api == "chat" else {"type": "function", "name": "get_city_code"},
         }
+        if required_tool_choice:
+            tool_options["tool_choice"] = "required"
         data.update(tool_options)
     entities = [] if dictionary else [_entity(prompt, original, entity_type)]
     if behavior and instruction == "repeat":
@@ -319,7 +444,7 @@ async def _round_trip_through_litellm_parser(
         for index in range(0, len(upstream_output), 3)
     ]
     events = []
-    if api == "chat":
+    if provider_api == "chat":
         for index, piece in enumerate(pieces):
             delta = {"content": piece}
             if output_kind == "arguments":
@@ -432,27 +557,36 @@ async def _round_trip_through_litellm_parser(
             }
         )
     wire = "".join("data: " + json.dumps(event) + "\n\n" for event in events)
-    if api == "chat":
+    if provider_api == "chat":
         wire += "data: [DONE]\n\n"
     transport_stream = _WireStream(wire.encode())
     requests = []
 
     def provider(request):
         assert request.url.path == (
-            "/v1/chat/completions" if api == "chat" else "/v1/responses"
+            "/v1/chat/completions" if provider_api == "chat" else "/v1/responses"
         )
         body = json.loads(request.content)
         requests.append(body)
         assert body.get("stream", False) is stream
         if require_tool:
-            assert body["tool_choice"] == tool_options["tool_choice"]
-        sent = body["messages"][0]["content"] if api == "chat" else body["input"]
+            expected_tool_choice = (
+                {"type": "function", "function": {"name": "get_city_code"}}
+                if provider_api == "chat" and not required_tool_choice
+                else tool_options["tool_choice"]
+            )
+            assert body["tool_choice"] == expected_tool_choice
+        sent = body["messages"][0]["content"] if provider_api == "chat" else body["input"]
+        if bridge:
+            assert "input" not in body
+            assert "use_chat_completions_api" not in body
+            assert body["model"] == "gpt-4o-mini"
         assert original not in sent
         assert provider_value in sent
         if corpus_case:
             assert all(value not in sent for value in mapping.values())
         if not stream:
-            if api == "chat":
+            if provider_api == "chat":
                 message = {"role": "assistant", "content": upstream_output}
                 if output_kind == "arguments":
                     message.update(
@@ -507,9 +641,15 @@ async def _round_trip_through_litellm_parser(
                 **tool_options,
             )
         else:
-            client = AsyncHTTPHandler()
-            await client.client.aclose()
-            client.client = http_client
+            if bridge:
+                client = AsyncOpenAI(
+                    api_key="synthetic-test-key", base_url="http://mock.invalid/v1",
+                    http_client=http_client,
+                )
+            else:
+                client = AsyncHTTPHandler()
+                await client.client.aclose()
+                client.client = http_client
             response = await litellm.aresponses(
                 model="openai/gpt-4o-mini",
                 input=masked["input"],
@@ -517,6 +657,7 @@ async def _round_trip_through_litellm_parser(
                 api_key="synthetic-test-key",
                 api_base="http://mock.invalid/v1",
                 client=client,
+                **({"use_chat_completions_api": True} if bridge else {}),
                 **tool_options,
             )
         if stream:
@@ -561,7 +702,12 @@ async def _round_trip_through_litellm_parser(
     else:
         documents = [event.model_dump() for event in restored]
         final_response = documents[-1]["response"] if stream else documents[0]
-        final_item = final_response["output"][0]
+        final_items = [
+            item for item in final_response["output"]
+            if item["type"] == ("function_call" if output_kind == "arguments" else "message")
+        ]
+        assert len(final_items) == 1
+        final_item = final_items[0]
         output = (
             "".join(event.get("delta", "") for event in documents)
             if stream

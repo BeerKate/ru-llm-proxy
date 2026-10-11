@@ -246,18 +246,50 @@ async def test_nonstream_unsuccessful_response_does_not_publish(harness, status)
 
 
 @pytest.mark.asyncio
-async def test_invalid_completed_event_never_publishes_or_exposes_success(harness):
+@pytest.mark.parametrize("status", ["failed", "cancelled", "in_progress", None])
+async def test_invalid_completed_event_never_publishes_or_exposes_success(harness, status):
     guardrail, store, temporary, auth = harness
     data = {"input": "alpha@example.test", "model": "gpt-6-luna", "stream": True}
     await guardrail.async_pre_call_hook(auth, None, data, "aresponses")
 
     async def events():
-        yield {"type": "response.completed", "response": response("child", "", status="incomplete")}
+        yield {"type": "response.completed", "response": response("child", "", status=status)}
 
     with pytest.raises(HTTPException) as failure:
         _ = [event async for event in guardrail.async_post_call_streaming_iterator_hook(auth, events(), data)]
     assert failure.value.status_code == 503
     assert not store.snapshots and not temporary
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("arguments", [False, True])
+async def test_incomplete_completed_wrapper_restores_without_publishing_child(harness, arguments):
+    guardrail, store, temporary, auth = harness
+    await complete(harness, "alpha@example.test", "parent", "<EMAIL_ADDRESS_1>")
+    parent = dict(store.snapshots)
+    data = {"input": "beta@example.test", "model": "gpt-6-luna", "stream": True,
+            "previous_response_id": "parent"}
+    await guardrail.async_pre_call_hook(auth, None, data, "aresponses")
+    text = '{"value":"<EMAIL_ADDRESS_2>"' if arguments else "<EMAIL_ADDRESS_2> / <EMAIL"
+    expected = '{"value":"beta@example.test"' if arguments else "beta@example.test / <EMAIL"
+    final = response("child", text, arguments=arguments, status="incomplete")
+    final["incomplete_details"] = {"reason": "max_output_tokens"}
+
+    async def events():
+        for number, piece in enumerate([text[:12], text[12:]]):
+            yield {"type": "response.function_call_arguments.delta" if arguments else "response.output_text.delta",
+                   "item_id": "item", "output_index": 0, "content_index": 0,
+                   "sequence_number": number, "delta": piece}
+        yield {"type": "response.completed", "sequence_number": 1, "response": final}
+
+    received = [event async for event in
+                guardrail.async_post_call_streaming_iterator_hook(auth, events(), data)]
+    assert received[-1]["type"] == "response.incomplete"
+    assert received[-1]["response"]["status"] == "incomplete"
+    assert received[-1]["response"]["incomplete_details"] == {"reason": "max_output_tokens"}
+    assert "".join(event.get("delta", "") for event in received) == expected
+    assert [event["sequence_number"] for event in received] == list(range(len(received)))
+    assert store.snapshots == parent and not temporary
 
 
 @pytest.mark.asyncio

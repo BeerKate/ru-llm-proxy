@@ -2,15 +2,20 @@
 
 import asyncio
 import copy
+import io
 import json
 import random
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 import litellm
 import anyio
 import pytest
 from openai.types.responses import (
+    Response,
+    ResponseCompletedEvent,
     ResponseFunctionCallArgumentsDeltaEvent,
+    ResponseIncompleteEvent,
     ResponseStreamEvent,
 )
 from pydantic import TypeAdapter
@@ -113,6 +118,82 @@ async def test_stream_tools_restore_city_and_escaped_code(api):
     else:
         result = "".join(_field(event, "delta") or "" for event in restored)
     assert json.loads(result) == {"city": original}
+    guardrail._redis.get.assert_awaited_once()
+    guardrail._redis.delete.assert_awaited_once_with("pii_mapping:stream-test")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("typed", [False, True])
+@pytest.mark.parametrize("missing_delta", [False, True])
+@pytest.mark.parametrize("tool_index", [0, 2])
+@pytest.mark.parametrize(
+    "arguments, expected",
+    [
+        ('{"city":"<LOC', '{"city":"<LOC'),
+        ('{"city":"<LOCATION_1>"', '{"city":"Tver"'),
+        ('{"city":"<LOCATION_1>\\u00', '{"city":"Tver\\u00'),
+        ('{"city":"<LOCATION_1>\\', '{"city":"Tver\\'),
+    ],
+)
+async def test_chat_truncated_arguments_flush_without_terminal_tool_calls(
+    monkeypatch, typed, missing_delta, tool_index, arguments, expected
+):
+    monkeypatch.delattr(litellm, "Delta", raising=False)
+    guardrail = _guardrail({"<LOCATION_1>": "Tver"})
+    events = [
+        _chat(
+            {
+                "tool_calls": [
+                    {
+                        "index": tool_index,
+                        "id": "call-truncated" if offset == 0 else None,
+                        "function": {
+                            "name": "get_city_code" if offset == 0 else None,
+                            "arguments": arguments[offset : offset + 3],
+                        },
+                    }
+                ]
+            },
+            choice=3,
+        )
+        for offset in range(0, len(arguments), 3)
+    ]
+    terminal = _chat({}, finish="length", choice=3)
+    if missing_delta:
+        terminal.choices[0].delta = None
+    # A repeated terminal must not flush the same buffered suffix twice.
+    events += [terminal, copy.deepcopy(terminal)]
+    if not typed:
+        events = [event.model_dump(exclude_none=True) for event in events]
+
+    restored = await _restore(guardrail, events)
+    calls = [
+        call
+        for event in restored
+        for choice in _field(event, "choices")
+        for call in _field(_field(choice, "delta"), "tool_calls") or []
+    ]
+    assert "".join(
+        _field(_field(call, "function"), "arguments") or "" for call in calls
+    ) == expected
+    with pytest.raises(json.JSONDecodeError):
+        json.loads(expected)
+    assert {_field(call, "index") for call in calls} == {tool_index}
+    assert [_field(call, "id") for call in calls if _field(call, "id")] == [
+        "call-truncated"
+    ]
+    assert [
+        _field(_field(call, "function"), "name")
+        for call in calls
+        if _field(_field(call, "function"), "name")
+    ] == ["get_city_code"]
+    for event in restored:
+        assert _field(event, "id") == "chat-stream-test"
+        assert _field(_field(event, "choices")[0], "index") == 3
+    assert [
+        _field(_field(event, "choices")[0], "finish_reason")
+        for event in restored[-2:]
+    ] == ["length", "length"]
     guardrail._redis.get.assert_awaited_once()
     guardrail._redis.delete.assert_awaited_once_with("pii_mapping:stream-test")
 
@@ -478,6 +559,115 @@ def _response(output, status="completed"):
         "tool_choice": "auto",
         "tools": [],
     }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("typed", [False, True])
+@pytest.mark.parametrize("mapping_mode", ["mapping", "empty", "no-request-id"])
+async def test_response_sequence_repaired_after_reset_duplicate_or_missing_number(
+    typed, mapping_mode,
+):
+    guardrail = _guardrail({"<LOCATION_1>": "Тверь"} if mapping_mode == "mapping" else {})
+    events = [_arguments_delta("safe", sequence=number) for number in [0, 3, 1, 1, None]]
+    if typed:
+        events = [ResponseFunctionCallArgumentsDeltaEvent.model_construct(**event) for event in events]
+    restored = await _restore(guardrail, events,
+        request_id=None if mapping_mode == "no-request-id" else "stream-test")
+    assert [_field(event, "sequence_number") for event in restored] == [0, 3, 4, 5, 6]
+    assert all(_field(event, "delta") == "safe" for event in restored)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("typed", [False, True])
+@pytest.mark.parametrize("mapping", [{}, {"<LOCATION_1>": "Тверь"}])
+async def test_completed_wrapper_of_incomplete_response_keeps_data_and_sdk_type(typed, mapping):
+    guardrail = _guardrail(mapping)
+    snapshot = _response([{"type": "reasoning", "id": "rs-test", "summary": [],
+                          "encrypted_content": "opaque-<LOCATION_1>"}], "incomplete")
+    snapshot.update(incomplete_details={"reason": "max_output_tokens"},
+                    usage={"input_tokens": 2, "input_tokens_details": {"cached_tokens": 0, "cache_write_tokens": 0},
+                           "output_tokens": 3, "output_tokens_details": {"reasoning_tokens": 1},
+                           "total_tokens": 5})
+    original = {"type": "response.completed", "sequence_number": 8,
+                "response": snapshot, "future_metadata": {"safe": True}}
+    event = TypeAdapter(ResponseStreamEvent).validate_python(original) if typed else copy.deepcopy(original)
+    restored = await _restore(guardrail, [event])
+    actual = restored[0].model_dump() if typed else restored[0]
+    assert actual["type"] == "response.incomplete"
+    assert actual["sequence_number"] == 8
+    assert actual["response"]["status"] == "incomplete"
+    assert actual["response"]["id"] == snapshot["id"]
+    assert actual["response"]["usage"] == snapshot["usage"]
+    assert actual["response"]["incomplete_details"] == snapshot["incomplete_details"]
+    assert actual["response"]["output"][0]["encrypted_content"] == "opaque-<LOCATION_1>"
+    assert actual["future_metadata"] == {"safe": True}
+    if typed:
+        assert isinstance(restored[0], ResponseIncompleteEvent)
+
+
+@pytest.mark.asyncio
+async def test_incomplete_envelope_preserves_sdk_payload_without_revalidating_it():
+    snapshot = Response.model_construct(**_response([], "incomplete"))
+    snapshot.usage = {"input_tokens": 1, "provider_specific": "preserve"}
+    event = ResponseCompletedEvent.model_construct(
+        type="response.completed", response=snapshot, sequence_number=2, future_field="keep")
+    restored = await _restore(_guardrail({}), [event], request_id=None)
+    assert isinstance(restored[0], ResponseIncompleteEvent)
+    assert restored[0].response is snapshot
+    assert restored[0].response.usage == {"input_tokens": 1, "provider_specific": "preserve"}
+    assert restored[0].future_field == "keep"
+
+
+@pytest.mark.asyncio
+async def test_clean_native_response_and_chat_chunks_are_unchanged():
+    events = [_arguments_delta("safe", sequence=number) for number in [4, 7, 8]]
+    events += [{"type": "responsesapi.websocket_timing", "duration_ms": 7}]
+    events += [_chat({"content": "safe"}), _chat({}, finish="stop")]
+    expected = copy.deepcopy(events)
+    restored = await _restore(_guardrail({}), events, request_id=None)
+    assert restored == expected
+    assert all(actual is original for actual, original in zip(restored, events))
+
+
+@pytest.mark.asyncio
+async def test_response_sequence_is_request_local_under_concurrency():
+    guardrail = _guardrail({})
+
+    async def request():
+        async def events():
+            for number in [0, 1, 0]:
+                yield _arguments_delta("safe", sequence=number)
+                await asyncio.sleep(0)
+        return [_field(event, "sequence_number") async for event in
+                guardrail.async_post_call_streaming_iterator_hook(MagicMock(), events(), {})]
+
+    assert await asyncio.gather(*(request() for _ in range(32))) == [[0, 1, 2]] * 32
+
+
+@pytest.mark.parametrize("tool", [False, True])
+def test_http_sse_reader_handles_done_extensions_and_reasoning_before_output(monkeypatch, tool):
+    monkeypatch.syspath_prepend(str(Path(__file__).resolve().parents[2] / "tests" / "e2e"))
+    from check_stream_disconnect import check_complete
+
+    arguments = json.dumps({"phone": "+79031234567", "note": 'quote" slash/'})
+    text = "safe +79031234567 tail"
+    item = ({"type": "function_call", "arguments": arguments} if tool else
+            {"type": "message", "content": [{"type": "output_text", "text": text}]})
+    values = [
+        {"type": "response.function_call_arguments.delta" if tool else "response.output_text.delta",
+         "sequence_number": 0, "delta": arguments if tool else text},
+        {"type": "responsesapi.websocket_timing", "duration_ms": 7},
+        {"type": "response.completed", "sequence_number": 1,
+         "response": {"status": "completed", "output": [{"type": "reasoning", "summary": []}, item]}},
+    ]
+    body = "".join("data: " + json.dumps(value) + "\n\n" for value in values) + "data: [DONE]\n\n"
+    result = io.BytesIO(body.encode())
+    result.status = 200
+    result.getheader = lambda name: "text/event-stream"
+    connection = MagicMock()
+    connection.getresponse.return_value = result
+    check_complete(connection, "/v1/responses", tool, bridge=True)
+    connection.close.assert_called_once()
 
 
 @pytest.mark.asyncio
