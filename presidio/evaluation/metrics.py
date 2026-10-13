@@ -87,8 +87,12 @@ def evaluate_predictions(
         unknown = ", ".join(sorted(unknown_case_ids))
         raise ValueError(f"predictions contain unknown case ids: {unknown}")
 
+    # Auxiliary annotations and predictions need the same exact-match domain.
+    evaluation_types = TARGET_ENTITY_TYPES | {
+        entity.entity_type for case in normalized_cases for entity in case.expected
+    }
     totals = Counter()
-    per_entity = {entity_type: Counter() for entity_type in TARGET_ENTITY_TYPES}
+    per_entity = {entity_type: Counter() for entity_type in evaluation_types}
     prediction_type_counts: Counter[str] = Counter()
     case_results: list[dict[str, Any]] = []
     critical_misses: list[dict[str, str]] = []
@@ -103,7 +107,7 @@ def evaluate_predictions(
         target_predictions = [
             prediction
             for prediction in predictions
-            if prediction.entity_type in TARGET_ENTITY_TYPES
+            if prediction.entity_type in evaluation_types
         ]
 
         true_positives, missing, unexpected = _exact_matches(
@@ -133,7 +137,7 @@ def evaluate_predictions(
             masking_covered=len(masking_covered),
         )
 
-        for entity_type in TARGET_ENTITY_TYPES:
+        for entity_type in evaluation_types:
             expected_for_type = [
                 entity for entity in case.expected if entity.entity_type == entity_type
             ]
@@ -213,7 +217,7 @@ def evaluate_predictions(
     )
 
     entity_metrics: dict[str, Any] = {}
-    for entity_type in sorted(TARGET_ENTITY_TYPES):
+    for entity_type in sorted(evaluation_types):
         counts = per_entity[entity_type]
         row = _metric_row(
             expected=counts["expected"],

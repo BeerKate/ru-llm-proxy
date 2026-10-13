@@ -108,6 +108,39 @@ def test_default_registry_does_not_mask_instructions(monkeypatch, case):
     assert response.json()["entities"] == []
 
 
+@pytest.mark.parametrize("entity_filter", [None, ["LOGIN"]])
+@pytest.mark.parametrize("source", [
+    "user: which file is needed?\nassistant: Done.",
+    "user: write tests for this feature\nassistant: Done.",
+    "user: Where are errors handled?\r\nassistant: Done.",
+])
+def test_default_registry_keeps_json_dialogue_roles_unmasked(monkeypatch, entity_filter, source):
+    _stub_loaded_ner(monkeypatch)
+    text = json.dumps({"nested": [{"source": source}]})
+    response = TestClient(analyzer_server.app).post(
+        "/api/v1/analyze", json={"text": text, "entities": entity_filter},
+    )
+    assert response.status_code == 200
+    assert response.json() == {"text": text, "entities": []}
+
+
+@pytest.mark.parametrize("entity_filter", [None, ["LOGIN"]])
+def test_default_registry_json_dialogue_keeps_real_login_offsets(monkeypatch, entity_filter):
+    _stub_loaded_ner(monkeypatch)
+    text = json.dumps({
+        "source": '😀 user instructions\nuser: which file is needed? LOGIN=dialogue_user_12\nassistant: Done.',
+        "user": "outside_user_34",
+    })
+    response = TestClient(analyzer_server.app).post(
+        "/api/v1/analyze", json={"text": text, "entities": entity_filter},
+    )
+    assert response.status_code == 200
+    assert {(r["entity_type"], r["start"], r["end"]) for r in response.json()["entities"]} == {
+        ("LOGIN", text.index(value), text.index(value) + len(value))
+        for value in ("dialogue_user_12", "outside_user_34")
+    }
+
+
 @pytest.mark.parametrize(
     "entity_type,value", [("PERSON", "Иван Петров"), ("ORGANIZATION", "ООО Вектор")]
 )

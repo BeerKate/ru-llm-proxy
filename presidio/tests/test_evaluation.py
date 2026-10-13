@@ -94,12 +94,13 @@ def test_default_corpus_covers_all_target_types_and_risk_classes():
 
 def test_instruction_corpus_separates_originals_pairs_and_holdouts():
     cases = load_corpus(DEFAULT_CORPUS_PATH.with_name("instruction_regressions.jsonl"))
-    assert len(cases) == 59
+    assert len(cases) == 70
     assert sum("original" in case.tags for case in cases) == 8
     assert sum("holdout" in case.tags for case in cases) == 14
-    assert sum("negative" in case.tags for case in cases) == 31
-    assert sum(case.critical for case in cases) == 28
-    assert sum("instruction_login_context" in case.tags for case in cases) == 16
+    assert sum("negative" in case.tags for case in cases) == 35
+    assert sum(case.critical for case in cases) == 35
+    assert sum("instruction_login_context" in case.tags for case in cases) == 27
+    assert sum("dialogue" in case.tags for case in cases) == 11
     assert {"PERSON", "ORGANIZATION"} <= {
         entity.entity_type
         for case in cases
@@ -115,6 +116,18 @@ def test_context_annotations_do_not_expand_mandatory_ner_targets():
     assert [e.entity_type for e in expected] == ["EMAIL_ADDRESS", "HOSTNAME"]
     assert [text[e.start:e.end] for e in expected] == ["sample@example.test", "host-01"]
     assert {"EMAIL_ADDRESS", "HOSTNAME"}.isdisjoint(TARGET_ENTITY_TYPES)
+
+
+def test_person_dialogue_research_has_explicit_scope_and_is_not_acceptance():
+    path = DEFAULT_CORPUS_PATH.with_name("person_dialogue_research.jsonl")
+    cases = load_corpus(path, required_entity_types=frozenset({"PERSON"}))
+    assert len(cases) == 46
+    assert all("research_only" in case.tags and "person_focus" in case.tags for case in cases)
+    assert sum("negative" in case.tags for case in cases) == 24
+    assert sum(case.critical for case in cases) == 22
+    assert all(e.entity_type == "PERSON" for case in cases for e in case.expected)
+    instruction_ids = {case.case_id for case in load_corpus(DEFAULT_CORPUS_PATH.with_name("instruction_regressions.jsonl"))}
+    assert not instruction_ids.intersection(case.case_id for case in cases)
 
 
 def test_name_corpus_has_explicit_scope_and_untuned_holdout():
@@ -228,6 +241,114 @@ def test_metrics_distinguish_exact_typed_and_masking_coverage():
     assert report["aggregate"]["critical_coverage_recall"] == 1.0
     assert report["prediction_type_counts"] == {"API_KEY": 1, "LOGIN": 1}
     assert report["critical_misses"] == []
+
+
+def _auxiliary_case(entity_type):
+    text = "sample@example.test" if entity_type == "EMAIL_ADDRESS" else "host-01"
+    return _case("auxiliary", text, (EntitySpan(entity_type, 0, len(text)),), critical=True)
+
+
+def _exact_prediction(span):
+    return {"entity_type": span.entity_type, "start": span.start, "end": span.end}
+
+
+@pytest.mark.parametrize("entity_type", ["EMAIL_ADDRESS", "HOSTNAME"])
+def test_metrics_count_annotated_auxiliary_types_as_exact_matches(entity_type):
+    case = _auxiliary_case(entity_type)
+    report = evaluate_predictions((case,), {case.case_id: [_exact_prediction(case.expected[0])]})
+
+    assert report["aggregate"]["true_positives"] == 1
+    assert report["aggregate"]["false_negatives"] == 0
+    assert report["aggregate"]["false_positives"] == 0
+    assert report["aggregate"]["f1"] == 1.0
+    assert report["per_entity"][entity_type]["true_positives"] == 1
+    assert report["cases"][0]["missing_entity_types"] == []
+    assert case.text not in json.dumps(report)
+
+
+@pytest.mark.parametrize("entity_type", ["EMAIL_ADDRESS", "HOSTNAME"])
+def test_metrics_count_missing_auxiliary_annotations_as_real_misses(entity_type):
+    case = _auxiliary_case(entity_type)
+    report = evaluate_predictions((case,), {case.case_id: []})
+
+    assert report["aggregate"]["false_negatives"] == 1
+    assert report["aggregate"]["critical_coverage_recall"] == 0.0
+    assert report["per_entity"][entity_type]["false_negatives"] == 1
+    assert report["critical_misses"] == [{"case_id": case.case_id, "entity_type": entity_type}]
+
+
+@pytest.mark.parametrize("entity_type", ["EMAIL_ADDRESS", "HOSTNAME"])
+def test_metrics_count_auxiliary_false_positives_on_negative_cases(entity_type):
+    positive = _auxiliary_case(entity_type)
+    negative = _case("negative", "ordinary", ())
+    predictions = {
+        positive.case_id: [_exact_prediction(positive.expected[0])],
+        negative.case_id: [{"entity_type": entity_type, "start": 0, "end": len(negative.text)}],
+    }
+    report = evaluate_predictions((positive, negative), predictions)
+
+    assert report["aggregate"]["true_positives"] == 1
+    assert report["aggregate"]["false_positives"] == 1
+    assert report["aggregate"]["false_negatives"] == 0
+    assert report["per_entity"][entity_type]["false_positives"] == 1
+    assert report["cases"][1]["unexpected_target_types"] == [entity_type]
+
+
+@pytest.mark.parametrize("entity_type", ["EMAIL_ADDRESS", "HOSTNAME"])
+def test_metrics_do_not_expand_to_an_unannotated_auxiliary_type(entity_type):
+    case = _auxiliary_case(entity_type)
+    other_type = "HOSTNAME" if entity_type == "EMAIL_ADDRESS" else "EMAIL_ADDRESS"
+    report = evaluate_predictions((case,), {case.case_id: [
+        _exact_prediction(case.expected[0]),
+        {"entity_type": other_type, "start": 0, "end": len(case.text)},
+    ]})
+
+    assert report["aggregate"]["f1"] == 1.0
+    assert set(report["per_entity"]) == TARGET_ENTITY_TYPES | {entity_type}
+    assert report["prediction_type_counts"][other_type] == 1
+
+
+@pytest.mark.parametrize("entity_type", ["EMAIL_ADDRESS", "HOSTNAME"])
+def test_metrics_count_duplicate_auxiliary_predictions_as_false_positive(entity_type):
+    case = _auxiliary_case(entity_type)
+    prediction = _exact_prediction(case.expected[0])
+    report = evaluate_predictions((case,), {case.case_id: [prediction, dict(prediction)]})
+
+    assert report["aggregate"]["true_positives"] == 1
+    assert report["aggregate"]["false_positives"] == 1
+    assert report["aggregate"]["false_negatives"] == 0
+
+
+def test_metrics_keep_wrong_type_distinct_from_masking_coverage_for_auxiliary_value():
+    case = _auxiliary_case("EMAIL_ADDRESS")
+    report = evaluate_predictions((case,), {case.case_id: [
+        {"entity_type": "PERSON", "start": 0, "end": len(case.text)},
+    ]})
+
+    assert report["aggregate"]["false_negatives"] == 1
+    assert report["aggregate"]["false_positives"] == 1
+    assert report["aggregate"]["typed_coverage_recall"] == 0.0
+    assert report["aggregate"]["masking_coverage_recall"] == 1.0
+    assert report["cases"][0]["missing_entity_types"] == ["EMAIL_ADDRESS"]
+    assert report["cases"][0]["unexpected_target_types"] == ["PERSON"]
+
+
+def test_metrics_preserve_default_77_case_scope_with_unannotated_auxiliary_predictions():
+    cases = load_corpus(DEFAULT_CORPUS_PATH)
+    assert len(cases) == 77
+    predictions = {case.case_id: [_exact_prediction(e) for e in case.expected] for case in cases}
+    reference = evaluate_predictions(cases, predictions)
+    predictions[cases[0].case_id].extend([
+        {"entity_type": "EMAIL_ADDRESS", "start": 0, "end": 1},
+        {"entity_type": "HOSTNAME", "start": 0, "end": 1},
+    ])
+    result = evaluate_predictions(cases, predictions)
+
+    assert result["aggregate"] == reference["aggregate"]
+    assert result["per_entity"] == reference["per_entity"]
+    assert result["critical_misses"] == reference["critical_misses"]
+    assert set(result["per_entity"]) == TARGET_ENTITY_TYPES
+    assert result["aggregate"]["f1"] == 1.0
 
 
 def test_metrics_report_critical_miss_without_raw_value():

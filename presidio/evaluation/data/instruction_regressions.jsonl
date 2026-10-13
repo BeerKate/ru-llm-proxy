@@ -57,3 +57,14 @@
 {"id":"login_command_named_pguser","annotated_text":"PGUSER={{LOGIN:Reply}}","critical":true,"tags":["positive","login","instruction_login_context","en"]}
 {"id":"login_command_named_ssh","annotated_text":"ssh {{LOGIN:Reply}}@{{HOSTNAME:go-i-ml-01}}","critical":true,"tags":["positive","login","instruction_login_context","en"]}
 {"id":"login_command_assignment_not_sentence","annotated_text":"login={{LOGIN:Reply}} only with that email.","critical":true,"tags":["positive","login","instruction_login_context","en"]}
+{"id":"dialogue_role_what","annotated_text":"<example>\nuser: what is 2+2?\nassistant: 4\n</example>","tags":["negative","dialogue","instruction_login_context","en"]}
+{"id":"dialogue_role_which","annotated_text":"user: which file contains the implementation?\nassistant: Done.","tags":["negative","dialogue","instruction_login_context","en"]}
+{"id":"dialogue_role_write","annotated_text":"user: write tests for new feature\nassistant: Done.","tags":["negative","dialogue","instruction_login_context","en"]}
+{"id":"dialogue_role_where","annotated_text":"user: Where are errors from the client handled?\nassistant: Done.","tags":["negative","dialogue","instruction_login_context","en"]}
+{"id":"dialogue_role_email","annotated_text":"<example>\nuser: what is the email {{EMAIL_ADDRESS:dialogue-contact@example.test}}?\nassistant: Done.\n</example>","critical":true,"tags":["positive","dialogue","instruction_login_context","en"]}
+{"id":"dialogue_role_nested_credentials","annotated_text":"user: what is LOGIN={{LOGIN:dialogue_user_12}} PASSWORD={{PASSWORD:DialoguePass-42}} AUTH_TOKEN={{AUTH_TOKEN:dialogue-auth-token-42}} SECRET_KEY={{SECRET_KEY:dialogue-secret-key-42}}\nassistant: Done.","critical":true,"tags":["positive","dialogue","instruction_login_context","en"]}
+{"id":"dialogue_role_user_assignment","annotated_text":"user: Please review user: {{LOGIN:svc_account_42}}\nassistant: Done.","critical":true,"tags":["positive","dialogue","instruction_login_context","en"]}
+{"id":"dialogue_role_ambiguous_field","annotated_text":"user: {{LOGIN:analytics}}\nassistant: helper","critical":true,"tags":["positive","dialogue","instruction_login_context","en"]}
+{"id":"dialogue_role_standalone_user","annotated_text":"user: {{LOGIN:analytics}}","critical":true,"tags":["positive","dialogue","instruction_login_context","en"]}
+{"id":"dialogue_role_json_field","annotated_text":"{\"user\": \"{{LOGIN:analytics}}\", \"assistant\": \"helper\"}","critical":true,"tags":["positive","dialogue","instruction_login_context","json"]}
+{"id":"dialogue_role_yaml_comment","annotated_text":"user: {{LOGIN:analytics}} # account\nassistant: helper","critical":true,"tags":["positive","dialogue","instruction_login_context","yaml"]}

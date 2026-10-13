@@ -1,9 +1,13 @@
 """Static contract for the real-model NER integration gate."""
 
+from dataclasses import replace
 from pathlib import Path
 
+import pytest
 import yaml
 
+from presidio.evaluation.corpus import CorpusCase, EntitySpan, load_corpus
+from tests.e2e.ner_instruction_checks import CORPUS, _check_instruction_exact_spans
 
 ROOT = Path(__file__).resolve().parents[1]
 WORKFLOW = ROOT / ".github" / "workflows" / "ner-model-integration.yml"
@@ -113,6 +117,64 @@ def test_name_corpora_gate_requires_complete_critical_spans_and_filter_agreement
     assert "combined name filter differs from full scan" in script
     assert '"fio_uppercase": (["PERSON"]' not in script
     assert '"holdout_legal_person": (["ORGANIZATION"]' not in script
+
+
+def _dialogue_email_case():
+    return next(case for case in load_corpus(CORPUS) if case.case_id == "dialogue_role_email")
+
+
+def _prediction(entity_type, start, end):
+    return {"entity_type": entity_type, "start": start, "end": end}
+
+
+@pytest.mark.parametrize("extra", [[], [_prediction("PERSON", 76, 80)]])
+def test_instruction_gate_accepts_only_the_agreed_done_extra_span(extra):
+    case = _dialogue_email_case()
+    assert case.expected == (EntitySpan("EMAIL_ADDRESS", 34, 63),)
+    result = [_prediction("EMAIL_ADDRESS", 34, 63), *extra]
+    assert _check_instruction_exact_spans(case, result) == (
+        [("PERSON", 76, 80)] if extra else []
+    )
+
+
+@pytest.mark.parametrize("extra", [
+    _prediction("LOGIN", 76, 80),
+    _prediction("PERSON", 76, 81),
+    _prediction("PERSON", 75, 80),
+    _prediction("PERSON", 16, 20),
+])
+def test_instruction_gate_rejects_any_other_extra_span(extra):
+    with pytest.raises(AssertionError, match="command or credential changed"):
+        _check_instruction_exact_spans(
+            _dialogue_email_case(), [_prediction("EMAIL_ADDRESS", 34, 63), extra]
+        )
+
+
+@pytest.mark.parametrize("email", [[], [_prediction("EMAIL_ADDRESS", 34, 62)]])
+def test_instruction_gate_does_not_accept_missing_or_partial_sensitive_value(email):
+    with pytest.raises(AssertionError, match="command or credential changed"):
+        _check_instruction_exact_spans(
+            _dialogue_email_case(), [*email, _prediction("PERSON", 76, 80)]
+        )
+
+
+@pytest.mark.parametrize("changes", [
+    {"text": "Changed example"},
+    {"expected": ()},
+    {"score_threshold": 0.7},
+])
+def test_instruction_gate_cannot_reuse_the_limitation_for_changed_source(changes):
+    with pytest.raises(AssertionError, match="no longer matches source annotation"):
+        _check_instruction_exact_spans(
+            replace(_dialogue_email_case(), **changes),
+            [_prediction("EMAIL_ADDRESS", 34, 63), _prediction("PERSON", 76, 80)],
+        )
+
+
+def test_instruction_gate_does_not_apply_done_limitation_to_other_cases():
+    case = CorpusCase("another_case", "Done", (), False, ("negative",))
+    with pytest.raises(AssertionError, match="command or credential changed"):
+        _check_instruction_exact_spans(case, [_prediction("PERSON", 0, 4)])
 
 
 def test_dkb_corpus_is_part_of_real_analyzer_gate():
