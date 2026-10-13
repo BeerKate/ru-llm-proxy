@@ -481,6 +481,173 @@ def test_contextual_login_rule_rejects_ordinary_prose(text):
 
 
 @pytest.mark.parametrize(
+    "utterance",
+    [
+        "what is 2+2?",
+        "what command should I run to list files?",
+        "what command should I run to watch files?",
+        "what files are in this directory?",
+        "which file contains the implementation?",
+        "write tests for new feature",
+        "Where are errors from the client handled?",
+        "Explain the result of the calculation.",
+    ],
+)
+@pytest.mark.parametrize("markup", [False, True])
+def test_login_rule_does_not_treat_dialogue_role_as_credential(utterance, markup):
+    text = f"user: {utterance}\nassistant: Done."
+    if markup:
+        text = f"<example>\n{text}\n</example>"
+    assert _results(LoginRecognizer(), text) == []
+
+
+@pytest.mark.parametrize("indent", ["", "  ", "\t"])
+@pytest.mark.parametrize("newline", ["\n", "\r\n"])
+def test_dialogue_role_refinement_preserves_offsets_and_repeated_turns(indent, newline):
+    text = newline.join(
+        [
+            "Instructions:",
+            f"{indent}USER: what is 2+2?",
+            f"{indent}Assistant: 4",
+            f"{indent}user: which file is needed? LOGIN=dialogue_user_12",
+            f"{indent}assistant: Done.",
+            "USER=outside_user_34",
+        ]
+    )
+    results = _results(LoginRecognizer(), text)
+    assert [text[r.start:r.end] for r in sorted(results, key=lambda r: r.start)] == [
+        "dialogue_user_12", "outside_user_34"
+    ]
+
+
+@pytest.mark.parametrize(
+    "text, expected",
+    [
+        ("user: analytics", "analytics"),
+        ("user: analytics\nassistant: helper", "analytics"),
+        ("user: analytics # account\nassistant: helper", "analytics"),
+        ("user: 'analytics' # account\nassistant: helper", "analytics"),
+        ('{"user": "analytics", "assistant": "helper"}', "analytics"),
+        ("user: what is needed?\nother: Done.", "what"),
+        ("user: what is needed?\n  assistant: Done.", "what"),
+        ("user: what is needed?\nassistant:", "what"),
+        ("prefix user: what is needed?\nassistant: Done.", "what"),
+        ("USER=analytics\nassistant: Done.", "analytics"),
+        ("config.user=analytics\nassistant: Done.", "analytics"),
+        ("PGUSER=analytics\nassistant: Done.", "analytics"),
+        ("smtp_user=mailer_bot\nassistant: Done.", "mailer_bot"),
+        ("username: ci_runner_12\nassistant: Done.", "ci_runner_12"),
+        ('user: "analytics" details\nassistant: Done.', "analytics"),
+    ],
+)
+def test_dialogue_role_refinement_keeps_credential_fields_and_ambiguous_text(text, expected):
+    results = _results(LoginRecognizer(), text)
+    assert [text[r.start:r.end] for r in results] == [expected]
+
+
+def test_dialogue_role_refinement_keeps_nested_credentials_and_other_classes():
+    text = (
+        "<example>\nuser: what is LOGIN=dialogue_user_12 "
+        "PASSWORD=DialoguePass-42 AUTH_TOKEN=dialogue-auth-token-42 "
+        "SECRET_KEY=dialogue-secret-key-42\nassistant: Done.\n</example>"
+    )
+    expected = {
+        "LOGIN": "dialogue_user_12",
+        "PASSWORD": "DialoguePass-42",
+        "AUTH_TOKEN": "dialogue-auth-token-42",
+        "SECRET_KEY": "dialogue-secret-key-42",
+    }
+    for recognizer in (LoginRecognizer(), PasswordRecognizer(), AuthTokenRecognizer(), SecretKeyRecognizer()):
+        results = _results(recognizer, text)
+        assert [(r.entity_type, text[r.start:r.end]) for r in results] == [
+            (recognizer.supported_entities[0], expected[recognizer.supported_entities[0]])
+        ]
+
+
+def test_dialogue_role_refinement_does_not_ignore_user_assignment_inside_replica():
+    text = (
+        "user: Please review user: svc_account_42 and ssh deploy@go-i-ml-01\n"
+        "assistant: Done."
+    )
+    results = _results(LoginRecognizer(), text)
+    assert [text[r.start:r.end] for r in sorted(results, key=lambda r: r.start)] == [
+        "svc_account_42", "deploy"
+    ]
+    assert _results(LoginRecognizer(), text, entities=["PASSWORD"]) == []
+
+
+@pytest.mark.parametrize("utterance", ["which file is needed?", "write tests for this feature", "Where are errors handled?", "what is 2+2?"])
+@pytest.mark.parametrize("structure", ["object", "list", "nested", "string"])
+def test_json_dialogue_roles_do_not_become_logins(utterance, structure):
+    source = f"user: {utterance}\nassistant: Done."
+    value = {
+        "object": {"source": source},
+        "list": [source],
+        "nested": {"history": [{"source": source}]},
+        "string": source,
+    }[structure]
+    text = json.dumps(value)
+    assert _results(LoginRecognizer(), text) == []
+
+
+@pytest.mark.parametrize("newline", ["\n", "\r\n"])
+@pytest.mark.parametrize("unicode_escapes", [False, True])
+def test_json_dialogue_offsets_keep_independent_credentials(newline, unicode_escapes):
+    from recognizers.json_strings import JsonStringRecognizer
+
+    source = newline.join([
+        'Quote " and slash \\ and emoji 😀',
+        'user: which file is needed? LOGIN=dialogue_user_12',
+        'assistant: Done.',
+        'user: write tests for this feature',
+        'assistant: Done.',
+    ])
+    text = json.dumps({"source": source, "USER": "outside_user_34"})
+    if unicode_escapes:
+        text = text.replace('\\n', '\\u000a').replace('\\r', '\\u000d').replace('which', '\\u0077hich')
+    results = _results(LoginRecognizer(), text) + _results(JsonStringRecognizer(), text, entities=["LOGIN"])
+    assert {(r.entity_type, r.start, r.end) for r in results} == {
+        ("LOGIN", text.index(value), text.index(value) + len(value))
+        for value in ("dialogue_user_12", "outside_user_34")
+    }
+
+
+@pytest.mark.parametrize("value", [
+    'user: analytics',
+    'user: analytics\nassistant: helper',
+    'user: analytics # account\nassistant: helper',
+    'user: "analytics" details\nassistant: Done.',
+    'USER=analytics\nassistant: Done.',
+    'PGUSER=analytics\nassistant: Done.',
+    'smtp_user=analytics\nassistant: Done.',
+])
+def test_json_dialogue_refinement_keeps_actual_and_ambiguous_logins(value):
+    from recognizers.json_strings import JsonStringRecognizer
+
+    text = json.dumps({"source": value})
+    results = _results(LoginRecognizer(), text) + _results(JsonStringRecognizer(), text, entities=["LOGIN"])
+    assert {(r.entity_type, text[r.start:r.end]) for r in results} == {("LOGIN", "analytics")}
+
+
+@pytest.mark.parametrize("text", [
+    '{"source":"user: which file is needed?\\nassistant: Done.","USER":"acct_12"',
+    '{"source":"user: which file is needed?\\nassistant: Done.","USER":"acct_12",}',
+    '{"source":"user: which file is needed?\\nassistant: Done.","number":NaN,"USER":"acct_12"}',
+    '{"source":"user: which file is needed?\\nassistant: Done."} trailing USER=acct_12',
+    '{"source":"\nuser: which file is needed?\nassistant: Done.\n","USER":"acct_12"}',
+])
+def test_invalid_json_never_suppresses_raw_login_detections(text):
+    results = _results(LoginRecognizer(), text)
+    assert {text[r.start:r.end] for r in results} == {"which", "acct_12"}
+
+
+def test_json_dialogue_in_key_does_not_suppress_native_detections():
+    text = json.dumps({'user: which file is needed?\nassistant: Done.': 'ordinary'})
+    results = _results(LoginRecognizer(), text)
+    assert [text[r.start:r.end] for r in results] == ["which"]
+
+
+@pytest.mark.parametrize(
     "text, rule_id, entity_type, expected_value",
     [
         (

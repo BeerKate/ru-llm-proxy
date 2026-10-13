@@ -41,3 +41,30 @@
 {"id":"instruction_holdout_org","annotated_text":"Платёж подготовлен для {{ORGANIZATION:Альфа-Банка}}. Верни получателя.","critical":true,"tags":["positive","organization","holdout"]}
 {"id":"instruction_holdout_auth_token","annotated_text":"Верни AUTH_TOKEN={{AUTH_TOKEN:synthetic-session-token-2031}} без пояснений.","critical":true,"tags":["positive","auth_token","holdout"]}
 {"id":"instruction_holdout_secret_key","annotated_text":"Верни SECRET_KEY={{SECRET_KEY:synthetic-key-material-2031}} без изменений.","critical":true,"tags":["positive","secret_key","holdout"]}
+{"id":"login_instruction_reply","annotated_text":"Reply only with that email.","tags":["negative","instruction","instruction_login_context","en"]}
+{"id":"login_instruction_respond","annotated_text":"Respond only with the address.","tags":["negative","instruction","instruction_login_context","en"]}
+{"id":"login_instruction_polite","annotated_text":"Please reply only with that email.","tags":["negative","instruction","instruction_login_context","en"]}
+{"id":"login_instruction_email_original","annotated_text":"The FIRST contact email is {{EMAIL_ADDRESS:stage102-first@example.test}}. Reply only with that email.","critical":true,"tags":["positive","instruction","instruction_login_context","en"]}
+{"id":"login_instruction_email_lowercase","annotated_text":"The FIRST contact email is {{EMAIL_ADDRESS:stage102-first@example.test}}. reply only with that email.","critical":true,"tags":["positive","instruction","instruction_login_context","en"]}
+{"id":"login_instruction_email_uppercase","annotated_text":"The FIRST contact email is {{EMAIL_ADDRESS:stage102-first@example.test}}. REPLY ONLY WITH THAT EMAIL.","critical":true,"tags":["positive","instruction","instruction_login_context","en"]}
+{"id":"login_instruction_email_polite","annotated_text":"The FIRST contact email is {{EMAIL_ADDRESS:stage102-first@example.test}}. Please reply only with that email.","critical":true,"tags":["positive","instruction","instruction_login_context","en"]}
+{"id":"login_instruction_email_respond","annotated_text":"The FIRST contact email is {{EMAIL_ADDRESS:stage102-first@example.test}}. Respond only with the address.","critical":true,"tags":["positive","instruction","instruction_login_context","en"]}
+{"id":"login_instruction_email_return","annotated_text":"The FIRST contact email is {{EMAIL_ADDRESS:stage102-first@example.test}}. Return only the email address.","critical":true,"tags":["positive","instruction","instruction_login_context","en"]}
+{"id":"login_instruction_email_russian","annotated_text":"Почта {{EMAIL_ADDRESS:stage102-first@example.test}}. Верни только адрес.","critical":true,"tags":["positive","instruction","instruction_login_context","ru"]}
+{"id":"login_command_named_account","annotated_text":"login={{LOGIN:Reply}}","critical":true,"tags":["positive","login","instruction_login_context","en"]}
+{"id":"login_command_named_username","annotated_text":"username: {{LOGIN:Reply}}","critical":true,"tags":["positive","login","instruction_login_context","en"]}
+{"id":"login_command_named_json","annotated_text":"{\"username\": \"{{LOGIN:Reply}}\"}","critical":true,"tags":["positive","login","instruction_login_context","json"]}
+{"id":"login_command_named_pguser","annotated_text":"PGUSER={{LOGIN:Reply}}","critical":true,"tags":["positive","login","instruction_login_context","en"]}
+{"id":"login_command_named_ssh","annotated_text":"ssh {{LOGIN:Reply}}@{{HOSTNAME:go-i-ml-01}}","critical":true,"tags":["positive","login","instruction_login_context","en"]}
+{"id":"login_command_assignment_not_sentence","annotated_text":"login={{LOGIN:Reply}} only with that email.","critical":true,"tags":["positive","login","instruction_login_context","en"]}
+{"id":"dialogue_role_what","annotated_text":"<example>\nuser: what is 2+2?\nassistant: 4\n</example>","tags":["negative","dialogue","instruction_login_context","en"]}
+{"id":"dialogue_role_which","annotated_text":"user: which file contains the implementation?\nassistant: Done.","tags":["negative","dialogue","instruction_login_context","en"]}
+{"id":"dialogue_role_write","annotated_text":"user: write tests for new feature\nassistant: Done.","tags":["negative","dialogue","instruction_login_context","en"]}
+{"id":"dialogue_role_where","annotated_text":"user: Where are errors from the client handled?\nassistant: Done.","tags":["negative","dialogue","instruction_login_context","en"]}
+{"id":"dialogue_role_email","annotated_text":"<example>\nuser: what is the email {{EMAIL_ADDRESS:dialogue-contact@example.test}}?\nassistant: Done.\n</example>","critical":true,"tags":["positive","dialogue","instruction_login_context","en"]}
+{"id":"dialogue_role_nested_credentials","annotated_text":"user: what is LOGIN={{LOGIN:dialogue_user_12}} PASSWORD={{PASSWORD:DialoguePass-42}} AUTH_TOKEN={{AUTH_TOKEN:dialogue-auth-token-42}} SECRET_KEY={{SECRET_KEY:dialogue-secret-key-42}}\nassistant: Done.","critical":true,"tags":["positive","dialogue","instruction_login_context","en"]}
+{"id":"dialogue_role_user_assignment","annotated_text":"user: Please review user: {{LOGIN:svc_account_42}}\nassistant: Done.","critical":true,"tags":["positive","dialogue","instruction_login_context","en"]}
+{"id":"dialogue_role_ambiguous_field","annotated_text":"user: {{LOGIN:analytics}}\nassistant: helper","critical":true,"tags":["positive","dialogue","instruction_login_context","en"]}
+{"id":"dialogue_role_standalone_user","annotated_text":"user: {{LOGIN:analytics}}","critical":true,"tags":["positive","dialogue","instruction_login_context","en"]}
+{"id":"dialogue_role_json_field","annotated_text":"{\"user\": \"{{LOGIN:analytics}}\", \"assistant\": \"helper\"}","critical":true,"tags":["positive","dialogue","instruction_login_context","json"]}
+{"id":"dialogue_role_yaml_comment","annotated_text":"user: {{LOGIN:analytics}} # account\nassistant: helper","critical":true,"tags":["positive","dialogue","instruction_login_context","yaml"]}

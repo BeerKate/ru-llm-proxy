@@ -15,6 +15,25 @@ from recognizers.credential_rules import (
 
 MAX_JSON_CHARS = 65536
 _STRING = re.compile(r'"(?:[^"\\]|\\.)*"', re.S)
+_KEY_SEPARATOR = re.compile(r"\s*:")
+
+
+def _reject_json_constant(value):
+    raise ValueError(f"Invalid JSON constant: {value}")
+
+
+def iter_json_string_values(text):
+    """Yield bounded valid JSON values with their original character offsets."""
+    if len(text) > MAX_JSON_CHARS or not text.lstrip().startswith(("{", "[", '"')):
+        return
+    try:
+        json.loads(text, parse_constant=_reject_json_constant)
+    except (ValueError, RecursionError):
+        return
+    for match in _STRING.finditer(text):
+        if _KEY_SEPARATOR.match(text, match.end()):
+            continue
+        yield decoded_string_offsets(text, match.start(), match.end())
 
 
 def decoded_string_offsets(text, start, end):

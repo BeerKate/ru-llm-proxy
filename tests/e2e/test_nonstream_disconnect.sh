@@ -32,7 +32,8 @@ config = {
             "model": "openai/mock-chat", "api_base": "http://mock-upstream:8080/v1",
             "api_key": "os.environ/OPENAI_API_KEY", "max_retries": 0,
             "timeout": 1 if name == "mock-timeout" else 30,
-        }} for name in ("mock-chat", "mock-timeout")
+            **({"use_chat_completions_api": True} if name == "mock-chat-bridge" else {}),
+        }} for name in ("mock-chat", "mock-timeout", "mock-chat-bridge")
     ],
     "guardrails": [
         {"guardrail_name": f"ru-pii-mask-{mode}", "litellm_params": {
@@ -62,6 +63,7 @@ PY
     if [ "$cancellation" = false ]; then
         "${COMPOSE[@]}" exec -T litellm python /workspace/tests/e2e/check_nonstream_disconnect.py --baseline
     else
+        "${COMPOSE[@]}" exec -T litellm python /workspace/tests/e2e/check_preprocessing_budget.py
         "${COMPOSE[@]}" exec -T litellm python /workspace/tests/e2e/check_upstream_transport.py
         if [ "${1:-}" != --stream-only ]; then
             "${COMPOSE[@]}" exec -T litellm python /workspace/tests/e2e/check_nonstream_disconnect.py

@@ -119,6 +119,65 @@ _SERVICE_NUMBER_RE = re.compile(
     r"(?i)(?<!\w)(?:номер|идентификатор)\s+"
     r"(?:заявки|заказа|строки)\s*[:=#№]?\s*$"
 )
+_INSTRUCTION_SPACE = r"[ \t\u00a0]{1,16}"
+_LOGIN_INSTRUCTION_RE = re.compile(
+    rf"(?:^|[.!?;]{_INSTRUCTION_SPACE}|[\r\n][ \t\u00a0]{{0,16}})"
+    rf"(?:please{_INSTRUCTION_SPACE})?"
+    rf"(?P<command>reply|respond|answer|return|print|output|copy)"
+    rf"{_INSTRUCTION_SPACE}(?:only|exactly|solely|exclusively|just)"
+    rf"{_INSTRUCTION_SPACE}"
+    rf"(?:(?:with|using){_INSTRUCTION_SPACE})?"
+    rf"(?:the|that|this){_INSTRUCTION_SPACE}"
+    rf"(?:email(?:{_INSTRUCTION_SPACE}address)?|address|value|text|result)\b",
+    re.IGNORECASE,
+)
+
+
+def _login_instruction_refinements(
+    text: str, results: list[RecognizerResult]
+) -> dict[tuple[int, int], int]:
+    candidates = {}
+    for result in results:
+        if (
+            detection_source(result) == SOURCE_NER
+            and result.entity_type == "LOGIN"
+            and _valid_span(result, len(text))
+        ):
+            candidates.setdefault(result.end, []).append(result)
+    if not candidates:
+        return {}
+    independent = sorted(
+        (r.start, r.end)
+        for r in results
+        if detection_source(r) != SOURCE_NER and _valid_span(r, len(text))
+    )
+    starts, max_ends = [], []
+    for start, end in independent:
+        starts.append(start)
+        max_ends.append(max(end, max_ends[-1] if max_ends else 0))
+    confirmed = {}
+    for match in _LOGIN_INSTRUCTION_RE.finditer(text):
+        start, end = match.span("command")
+        if end not in candidates:
+            continue
+        prefix = text[max(0, match.start() - 32):match.start()].rstrip(" \t\u00a0\r")
+        if prefix.endswith(("=", ":")):
+            continue
+        # Independent recognizers veto suppression, including wider containers.
+        index = bisect_left(starts, end) - 1
+        if index >= 0 and max_ends[index] > start:
+            continue
+        for result in candidates[end]:
+            if result.start == start:
+                confirmed[(result.start, result.end)] = result.start
+            elif result.start < match.start():
+                trim_end = match.start()
+                # A newline does not prove preceding punctuation is a separator.
+                while trim_end > result.start and text[trim_end - 1] in " \t\u00a0\r\n":
+                    trim_end -= 1
+                if trim_end > result.start:
+                    confirmed[(result.start, result.end)] = trim_end
+    return confirmed
 
 
 @dataclass(frozen=True)
@@ -249,6 +308,7 @@ def merge_results(
     contract_evidence = contract_context_evidence(text)
     reference_spans = []
     results = list(results)
+    login_instructions = _login_instruction_refinements(text, results)
     if any(detection_source(r) == SOURCE_NER and r.entity_type in _CREDENTIAL_ENTITY_TYPES for r in results):
         from recognizers.credential_rules import credential_reference_spans
         reference_spans = credential_reference_spans(text)
@@ -260,6 +320,21 @@ def merge_results(
                 MergeDecision("invalid_span", SOURCE_NONE, source)
             )
             continue
+        if (
+            source == SOURCE_NER
+            and result.entity_type == "LOGIN"
+            and (result.start, result.end) in login_instructions
+        ):
+            end = login_instructions[(result.start, result.end)]
+            if end == result.start:
+                decisions.append(
+                    MergeDecision("login_instruction_suppressed", SOURCE_NONE, SOURCE_NER)
+                )
+                continue
+            result = _copy_name(result, end=end)
+            decisions.append(
+                MergeDecision("login_instruction_tail", SOURCE_NER, SOURCE_NER)
+            )
         if (
             source == SOURCE_NER
             and result.entity_type in _CREDENTIAL_ENTITY_TYPES

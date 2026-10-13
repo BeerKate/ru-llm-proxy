@@ -13,8 +13,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from recognizers import ALL_RECOGNIZERS
 from recognizers.base64_data import Base64DataRecognizer, MAX_CANDIDATES, decode_candidate
 from recognizers.sql_credentials import SqlCredentialRecognizer
-from recognizers.json_strings import MAX_JSON_CHARS, JsonStringRecognizer, decoded_string_offsets
-from recognizers.credential_rules import AuthTokenRecognizer, PasswordRecognizer
+from recognizers.json_strings import (
+    MAX_JSON_CHARS, JsonStringRecognizer, decoded_string_offsets, iter_json_string_values,
+)
+from recognizers.credential_rules import AuthTokenRecognizer, LoginRecognizer, PasswordRecognizer
 from result_merging import merge_results
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -248,3 +250,72 @@ def test_declared_container_does_not_leave_an_inner_key_tail(field, entity):
 ])
 def test_json_projection_is_conservative_and_bounded(text):
     assert JsonStringRecognizer().analyze(text, ["PASSWORD", "BASE64_DATA"]) == []
+
+
+@pytest.mark.parametrize("source", [
+    'user: which file is needed?\nassistant: Done.',
+    'user: write tests for this feature\nassistant: Done.',
+    'user: Where are errors handled?\nassistant: Done.',
+])
+def test_json_projection_and_raw_login_rules_agree_on_dialogue_roles(source):
+    text = json.dumps({"nested": [{"source": source}]})
+    assert JsonStringRecognizer().analyze(text, ["LOGIN"]) == []
+    assert LoginRecognizer().analyze(text, ["LOGIN"]) == []
+    assert not deterministic_entities(text)
+
+
+def test_json_dialogue_refinement_never_excludes_surrounding_secrets():
+    source = (
+        'user: which file is needed? LOGIN=dialogue_user_12 PASSWORD=DialoguePass-42 '
+        'AUTH_TOKEN=dialogue-auth-token-42 SECRET_KEY=dialogue-secret-key-42\n'
+        'assistant: Done.'
+    )
+    text = json.dumps({"source": source, "user": "outside_user_34"})
+    results = deterministic_entities(text)
+    assert {(r.entity_type, text[r.start:r.end]) for r in results} == {
+        ("LOGIN", "dialogue_user_12"), ("LOGIN", "outside_user_34"),
+        ("PASSWORD", "DialoguePass-42"), ("AUTH_TOKEN", "dialogue-auth-token-42"),
+        ("SECRET_KEY", "dialogue-secret-key-42"),
+    }
+
+
+def test_json_dialogue_limit_retains_conservative_login_check():
+    text = json.dumps({"padding": "a" * MAX_JSON_CHARS, "source": 'user: which file is needed?\nassistant: Done.'})
+    results = LoginRecognizer().analyze(text, ["LOGIN"])
+    assert [text[r.start:r.end] for r in results] == ["which"]
+
+
+def test_json_value_iterator_excludes_keys_and_projects_surrogates():
+    values = ['user: which file is needed?\r\nassistant: Done.', '😀 quote " slash \\ Ж']
+    text = json.dumps({'user: write tests\nassistant: Done.': values})
+    views = list(iter_json_string_values(text))
+    assert [decoded for decoded, _offsets in views] == values
+    for decoded, offsets in views:
+        assert len(offsets) == len(decoded) + 1
+        assert offsets == sorted(set(offsets))
+        for index, character in enumerate(decoded):
+            assert json.loads('"' + text[offsets[index]:offsets[index + 1]] + '"') == character
+
+
+@pytest.mark.parametrize("text", [
+    '{"source": broken}',
+    '{"source": "ordinary", "number": Infinity}',
+    json.dumps({"source": 'a' * MAX_JSON_CHARS}),
+    '[' * 2000 + '"ordinary"' + ']' * 2000,
+])
+def test_json_value_iterator_rejects_invalid_or_excessive_inputs(text):
+    assert list(iter_json_string_values(text)) == []
+
+
+def test_explicit_json_login_field_is_not_exempted_by_dialogue_content():
+    source = 'user: which file is needed?\nassistant: Done.'
+    text = json.dumps({"user": source})
+    results = deterministic_entities(text)
+    assert len(results) == 1 and results[0].entity_type == "LOGIN"
+    assert json.loads('"' + text[results[0].start:results[0].end] + '"') == source
+
+
+def test_duplicate_json_fields_keep_all_source_values_protected():
+    text = '{"source":"USER=acct_12","source":"user: which file is needed?\\nassistant: Done."}'
+    results = deterministic_entities(text)
+    assert {(r.entity_type, text[r.start:r.end]) for r in results} == {("LOGIN", "acct_12")}

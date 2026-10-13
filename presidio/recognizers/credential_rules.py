@@ -260,6 +260,12 @@ def _defined_code_symbols(text):
 class LoginRecognizer(_CapturedCredentialRecognizer):
     """Recognize login values behind strict login and username keys."""
 
+    _DIALOGUE_ROLE_RE = re.compile(
+        r"(?im)^(?P<indent>[ \t]{0,16})user[ \t]{0,16}:[ \t]{0,16}"
+        r"(?P<body>[^ \t\r\n][^\r\n]*)\r?\n"
+        r"(?P=indent)assistant[ \t]{0,16}:[ \t]{0,16}(?=\S)"
+    )
+
     RULES = (
         _assignment_rule(
             "credential.kv.login",
@@ -309,6 +315,47 @@ class LoginRecognizer(_CapturedCredentialRecognizer):
             name=name,
             supported_language=supported_language,
         )
+
+    def analyze(self, text, entities, nlp_artifacts=None):
+        results = super().analyze(text, entities, nlp_artifacts)
+        if not results:
+            return results
+        if text.lstrip().startswith(("{", "[", '"')):
+            # The projection module imports these recognizers during registration.
+            from recognizers.json_strings import iter_json_string_values
+
+            role_values = {
+                offsets[start]
+                for decoded, offsets in iter_json_string_values(text)
+                for start in self._dialogue_role_values(decoded)
+            }
+        else:
+            role_values = self._dialogue_role_values(text)
+        return [
+            result
+            for result in results
+            if not (
+                result.recognition_metadata.get(RULE_ID_METADATA_KEY)
+                == "credential.kv.login"
+                and result.start in role_values
+            )
+        ]
+
+    @classmethod
+    def _dialogue_role_values(cls, text):
+        role_values = set()
+        for match in cls._DIALOGUE_ROLE_RE.finditer(text):
+            body = match.group("body")
+            parts = body.split(maxsplit=1)
+            # A single/quoted value or YAML comment still looks like credentials.
+            if (
+                body[0] in _QUOTE_PAIRS
+                or len(parts) < 2
+                or parts[1].startswith(("#", "//"))
+            ):
+                continue
+            role_values.add(match.start("body"))
+        return role_values
 
     def _accept_value(self, value: str, rule_id: str) -> bool:
         accepted = (

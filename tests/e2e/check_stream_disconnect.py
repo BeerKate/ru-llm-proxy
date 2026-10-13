@@ -14,9 +14,9 @@ FAILURES = []
 CHECKS = 0
 
 
-def started(host, path, tool=False, extra="", *, wait_loaded=True):
+def started(host, path, tool=False, extra="", *, wait_loaded=True, model="mock-chat"):
     marker = "SSE_CONTROLLED " + ("SSE_TOOL " if tool else "") + extra
-    case_id, connection, before, _ = begin(host, path, marker, stream=True)
+    case_id, connection, before, _ = begin(host, path, marker, model=model, stream=True)
     key = accepted(case_id, before)
     release(case_id)
     wait_for(lambda: state(case_id, "stream_first"), "provider SSE headers sent")
@@ -77,7 +77,7 @@ def restored(values, path, tool):
     return "".join(fragments)
 
 
-def check_complete(connection, path, tool):
+def check_complete(connection, path, tool, *, bridge=False):
     response = connection.getresponse()
     assert response.status == 200, response.status
     assert response.getheader("content-type").startswith("text/event-stream")
@@ -92,11 +92,17 @@ def check_complete(connection, path, tool):
     if path.endswith("responses"):
         complete = next(value for value in values if value.get("type") == "response.completed")
         snapshot = complete["response"]
-        assert snapshot["output"][1]["encrypted_content"] == OPAQUE
-        assert snapshot["usage"]["total_tokens"] == 2
-        sequence = [value["sequence_number"] for value in values if "sequence_number" in value]
+        if not bridge:
+            assert snapshot["output"][1]["encrypted_content"] == OPAQUE
+            assert snapshot["usage"]["total_tokens"] == 2
+        response_events = [value for value in values if isinstance(value, dict)
+                           and value.get("type", "").startswith("response.")]
+        assert all(type(value.get("sequence_number")) is int for value in response_events)
+        sequence = [value["sequence_number"] for value in response_events]
         assert sequence == sorted(set(sequence)), sequence
-        item = snapshot["output"][0]
+        items = [item for item in snapshot["output"] if item["type"] == ("function_call" if tool else "message")]
+        assert len(items) == 1, snapshot
+        item = items[0]
         if tool:
             assert json.loads(item["arguments"]) == json.loads(actual)
         else:
@@ -110,9 +116,9 @@ def finish(case_id, phases):
         release(case_id, phase)
 
 
-def check_cancel(host, path, tool, phase):
+def check_cancel(host, path, tool, phase, *, model="mock-chat"):
     phases = PHASES_TOOL if tool else PHASES_TEXT
-    case_id, connection, key = started(host, path, tool)
+    case_id, connection, key = started(host, path, tool, model=model)
     try:
         advance(case_id, phases, phase)
         if phase != "stream_first":
@@ -142,10 +148,10 @@ def check_cancel(host, path, tool, phase):
             release(case_id, boundary)
 
 
-def check_provider(host, path, tool, phase=None, error=False):
+def check_provider(host, path, tool, phase=None, error=False, *, model="mock-chat"):
     phases = PHASES_TOOL if tool else PHASES_TEXT
     extra = "SSE_ERROR" if error else ("SSE_EOF_" + phase.upper() if phase else "")
-    case_id, connection, key = started(host, path, tool, extra)
+    case_id, connection, key = started(host, path, tool, extra, model=model)
     try:
         for boundary in phases:
             wait_for(lambda: state(case_id, boundary), "provider phase " + boundary)
@@ -153,7 +159,7 @@ def check_provider(host, path, tool, phase=None, error=False):
             if boundary == phase:
                 break
         if not phase and not error:
-            check_complete(connection, path, tool)
+            check_complete(connection, path, tool, bridge=model == "mock-chat-bridge")
         else:
             response = connection.getresponse()
             values = events(response)
@@ -327,6 +333,20 @@ def run():
                 run_case(label + " clean " + mode, lambda: check_clean_stream(host, path, mode))
         for pii in (False, True):
             run_case(host + " chat missing choice pii=" + str(pii), lambda: check_missing_choice(host, pii))
+        path = "/v1/responses"
+        for tool in (False, True):
+            phases = PHASES_TOOL if tool else PHASES_TEXT
+            label = f"{host} Responses Chat bridge tool={tool}"
+            for phase in phases:
+                run_case(label + " cancel " + phase,
+                         lambda: check_cancel(host, path, tool, phase, model="mock-chat-bridge"))
+            for phase in (phases[2], "stream_partial"):
+                run_case(label + " EOF " + phase,
+                         lambda: check_provider(host, path, tool, phase, model="mock-chat-bridge"))
+            run_case(label + " error",
+                     lambda: check_provider(host, path, tool, error=True, model="mock-chat-bridge"))
+            run_case(label + " next success",
+                     lambda: check_provider(host, path, tool, model="mock-chat-bridge"))
     print(json.dumps({"checks": CHECKS, "failures": FAILURES, "measurements": MEASUREMENTS,
                       "leftover_mappings": len(mappings() - initial_mappings),
                       "preserved_initial_mappings": len(mappings() & initial_mappings)}, indent=2), flush=True)
