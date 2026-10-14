@@ -37,7 +37,7 @@ def test_model_coefficients_and_thresholds_are_frozen():
     "getUserProfileById /usr/local/lib/python3.13",
 ])
 def test_plain_text_has_no_new_base64(text):
-    assert Base64DataRecognizer(policy="logistic").analyze(text, ["BASE64_DATA"]) == []
+    assert Base64DataRecognizer(policy="logistic").analyze_document(text, ["BASE64_DATA"]) == []
 
 
 @pytest.mark.parametrize("urlsafe,padding", [(False, True), (False, False), (True, True), (True, False)])
@@ -48,8 +48,10 @@ def test_plain_encoded_message_is_detected_without_sensitive_content(urlsafe, pa
         value = value.rstrip("=")
     text = "Передано " + value + "."
     recognizer = Base64DataRecognizer(policy="logistic")
-    assert slices(text, recognizer.analyze(text, ["BASE64_DATA"])) == [("BASE64_DATA", value)]
-    assert recognizer.analyze(text, ["PERSON"]) == []
+    assert slices(text, recognizer.analyze_document(text, ["BASE64_DATA"])) == [("BASE64_DATA", value)]
+    assert recognizer.analyze_document(text, ["PERSON"]) == []
+    # Chunk-level analysis keeps the content policy; the cascade is document-level.
+    assert recognizer.analyze(text, ["BASE64_DATA"]) == []
 
 
 @pytest.mark.parametrize("key,kind", [("Base64", "BASE64_DATA"), ("password_base64", "PASSWORD")])
@@ -58,24 +60,37 @@ def test_native_declarations_keep_full_value_and_type(key, kind, value):
     text = f'{key}: "{value}"'
     recognizer = Base64DataRecognizer(policy="logistic")
     assert slices(text, recognizer.analyze(text, [kind])) == [(kind, value)]
+    assert slices(text, recognizer.analyze_document(text, [kind])) == [(kind, value)]
 
 
-def test_logistic_does_not_call_upstream_content_inspection(monkeypatch):
-    recognizer = Base64DataRecognizer(policy="logistic")
-    def forbidden(*args, **kwargs):
-        raise AssertionError("upstream content inspection must not run in logistic mode")
-    monkeypatch.setattr(recognizer, "_has_sensitive_content", forbidden)
-    value = base64.b64encode("обычное сообщение без секретов".encode()).decode()
-    assert recognizer.analyze(value, ["BASE64_DATA"])
+@pytest.mark.parametrize("source", ["a@b.co", "a@b.ru", "x@y.io", "p@q.org", "ab@c.ru"])
+def test_logistic_keeps_content_protection_of_short_values(source):
+    # Short canonical encodings rejected by the cascade stay protected by content.
+    value = base64.b64encode(source.encode()).decode().rstrip("=")
+    content = Base64DataRecognizer(policy="content")
+    logistic = Base64DataRecognizer(policy="logistic")
+    for text in (value, f"Значение {value} получено.", json.dumps({"v": value})):
+        expected = [("BASE64_DATA", value)]
+        assert slices(text, content.analyze(text, ["BASE64_DATA"])) == expected
+        assert slices(text, logistic.analyze(text, ["BASE64_DATA"])) == expected
 
 
-def test_json_escaped_base64_keeps_original_source_offsets(monkeypatch):
-    from recognizers.json_strings import JsonStringRecognizer
-    monkeypatch.setenv(POLICY_ENV, "logistic")
+def test_content_findings_are_unchanged_by_logistic_policy():
+    samples = [
+        base64.b64encode(source.encode()).decode()
+        for source in ("ivan.petrov@example.com", "+7 915 123-45-67", "обычная строка", "test")
+    ]
+    text = " ".join(samples)
+    content = Base64DataRecognizer(policy="content").analyze(text, None)
+    logistic = Base64DataRecognizer(policy="logistic").analyze(text, None)
+    assert {(r.start, r.end, r.entity_type) for r in content} == {(r.start, r.end, r.entity_type) for r in logistic}
+
+
+def test_json_escaped_base64_keeps_original_source_offsets():
     value = base64.b64encode("строка для проверки смещений".encode()).decode()
-    # Escaping a valid symbol requires the native JSON projection, not replacement.
+    # Escaping a valid symbol requires the JSON projection, not replacement.
     text = json.dumps({"message": value}).replace(value[0], "\\u%04x" % ord(value[0]), 1)
-    results = JsonStringRecognizer().analyze(text, ["BASE64_DATA"])
+    results = Base64DataRecognizer(policy="logistic").analyze_document(text, ["BASE64_DATA"])
     assert len(results) == 1
     encoded = text[results[0].start:results[0].end]
     assert json.loads('"' + encoded + '"') == value

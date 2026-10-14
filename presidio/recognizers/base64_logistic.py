@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import base64
 import binascii
+from bisect import bisect_left, bisect_right
 import re
 
 MIN_LEN = 16       # минимальная длина core без паддинга для "голого" кандидата
@@ -261,28 +262,113 @@ def is_base64(tok: str) -> bool:
     return randomness_score(head) > _threshold(L, pad)
 
 
-# MIME-перенос: короткая последняя строка блока после строк полной ширины 64/76.
-TAIL = re.compile(r"[ \t]*(?:\r?\n|  )[ \t]*([A-Za-z0-9+/]{1,76}={0,2})(?![A-Za-z0-9+/=])")
+# --- сборка диапазонов ----------------------------------------------------------
+MIME_WIDTHS = (64, 76)  # ширина строк MIME/PEM: только такие строки продолжаются следующей
+# Перевод строки между строками блока: настоящий или экранированный в JSON (\n, \r\n).
+LINE_GAP = re.compile(r"(?:\r?\n|\\r\\n|\\n)[ \t]*")
+# Короткая последняя строка блока — целая строка, после неё конец строки, текста или кавычки.
+TAIL = re.compile(r"(?:\r?\n|\\r\\n|\\n)[ \t]*([A-Za-z0-9+/]{1,75}={0,2})(?=[ \t]*(?:\r?\n|\\r\\n|\\n|[\"']|$))")
 
 
-def _is_mime_tail(t: str) -> bool:
-    return t.endswith("=") or "+" in t or "/" in t or (
-        len(t) >= 4 and not t.isdigit() and t != t.lower() and t != t.upper())
+def merge_spans(spans) -> list[tuple[int, int]]:
+    """Отсортировать и объединить пересекающиеся или соприкасающиеся диапазоны."""
+    merged: list[list[int]] = []
+    for s, e in sorted(spans):
+        if merged and s <= merged[-1][1]:
+            merged[-1][1] = max(merged[-1][1], e)
+        else:
+            merged.append([s, e])
+    return [(s, e) for s, e in merged]
+
+
+def subtract_spans(text: str, spans, protected) -> list[tuple[int, int]]:
+    """Части диапазонов spans вне protected; оба списка — отсортированные без пересечений
+    (protected объединяется здесь). Края части очищаются от пробелов, пустые части отбрасываются."""
+    protected = merge_spans(protected)
+    parts, i = [], 0
+    for s, e in spans:
+        while i < len(protected) and protected[i][1] <= s:
+            i += 1
+        cursor, j = s, i
+        while j < len(protected) and protected[j][0] < e:
+            a, b = protected[j]
+            if a > cursor:
+                parts.append((cursor, a))
+            cursor = max(cursor, b)
+            j += 1
+        if cursor < e:
+            parts.append((cursor, e))
+    result = []
+    for s, e in parts:
+        while s < e and text[s].isspace():
+            s += 1
+        while e > s and text[e - 1].isspace():
+            e -= 1
+        if any(ch.isalnum() for ch in text[s:e]):
+            result.append((s, e))
+    return result
+
+
+def _covered(intervals, starts, s, e) -> bool:
+    i = bisect_right(starts, s) - 1
+    return i >= 0 and intervals[i][1] >= e
+
+
+def _overlaps(intervals, starts, s, e) -> bool:
+    i = bisect_left(starts, e) - 1
+    return i >= 0 and intervals[i][1] > s
+
+
+def _valid_block_length(chars: str) -> bool:
+    core = chars.rstrip("=")
+    pad = len(chars) - len(core)
+    return len(core) % 4 != 1 and (not pad or len(chars) % 4 == 0)
+
+
+def _join_mime_lines(text: str, spans) -> list[tuple[int, int]]:
+    """Объединить строки одного MIME/PEM-блока и добавить его короткую последнюю строку.
+
+    Строка продолжается следующей, только если её ширина ровно 64 или 76 символов
+    и между ними один перевод строки. Соседство само по себе не объединяет значения.
+    """
+    blocks: list[list[int]] = []  # [начало, конец, начало последней строки]
+    for s, e in spans:
+        if blocks:
+            start, end, last = blocks[-1]
+            if end - last in MIME_WIDTHS and LINE_GAP.fullmatch(text, end, s):
+                blocks[-1][1:] = [e, s]
+                continue
+        blocks.append([s, e, s])
+    out = []
+    for start, end, last in blocks:
+        if end - last in MIME_WIDTHS:
+            m = TAIL.match(text, end)
+            if m:
+                line = m.group(1)
+                block = re.sub(r"[^A-Za-z0-9+/=]", "", text[start:end].replace("\\n", "").replace("\\r", "")) + line
+                # Обычное слово на следующей строке (UserName, HelloWorld) — не хвост:
+                # у хвоста есть паддинг, цифра или символ +/.
+                if (line.endswith("=") or any(c in "+/0123456789" for c in line)) and _valid_block_length(block):
+                    end = m.end(1)
+        out.append((start, end))
+    return out
 
 
 def find_spans(text: str) -> list[tuple[int, int]]:
-    """Диапазоны Base64 в исходном тексте, отсортированные и без пересечений."""
+    """Диапазоны Base64 в исходном тексте, отсортированные и без пересечений.
+
+    Время линейно по длине текста: пересечения проверяются бинарным поиском
+    по отсортированным диапазонам, а не перебором уже найденного."""
     scan = JSON_ESC.sub(lambda m: " " * len(m.group()), text) if "\\" in text else text
-    spans: list[tuple[int, int]] = []
-    for rx in (DATA_URI, JWT, PEM):
-        spans += [m.span() for m in rx.finditer(scan)]
-
-    def covered(s, e):
-        return any(a <= s and e <= b for a, b in spans)
-
+    structural = merge_spans(m.span() for rx in (DATA_URI, JWT, PEM) for m in rx.finditer(scan))
+    s_starts = [s for s, _ in structural]
+    spans = list(structural)
     for m in CANDIDATE.finditer(scan):
-        if not covered(*m.span()) and is_base64(m.group()):
-            spans.append(m.span())
+        s, e = m.span()
+        if not _covered(structural, s_starts, s, e) and is_base64(m.group()):
+            spans.append((s, e))
+    found = merge_spans(spans)
+    f_starts = [s for s, _ in found]
 
     # Контекстный проход только в окнах вокруг пометок base64: иначе на коде, где base64
     # упоминается часто, пришлось бы проверять каждое слово документа.
@@ -293,10 +379,11 @@ def find_spans(text: str) -> list[tuple[int, int]]:
             regions[-1][1] = b
         else:
             regions.append([a, b])
+    context = []
     for ra, rb in regions:
         for m in SHORT_CAND.finditer(scan, ra, min(rb, len(scan))):
             s, e = m.span()
-            if any(a < e and s < b for a, b in spans):
+            if _overlaps(found, f_starts, s, e):
                 continue
             # кавычки проверяются по исходному тексту: в JSON они экранированы (\"), а в scan уже пробелы
             quoted = s > 0 and text[s - 1] in "\"'" and text[e:e + 1] in ("\"", "'", "\\")
@@ -306,20 +393,5 @@ def find_spans(text: str) -> list[tuple[int, int]]:
                 continue
             if (immediate or B64_MARKER.search(before) or B64_MARKER.search(scan[e:e + CONTEXT_WINDOW])) \
                     and _context_base64(m.group(), immediate):
-                spans.append((s, e))
-
-    # Соседние куски, разделённые только пробелами (MIME-перенос по 64/76), объединяются.
-    spans.sort()
-    merged: list[list[int]] = []
-    for s, e in spans:
-        if merged and (s <= merged[-1][1] or scan[merged[-1][1]:s].strip() == ""):
-            merged[-1][1] = max(merged[-1][1], e)
-        else:
-            merged.append([s, e])
-    for sp in merged:
-        last_line = scan[sp[0]:sp[1]].split()[-1] if scan[sp[0]:sp[1]].split() else ""
-        if sp[1] - sp[0] >= 60 and len(last_line) in (64, 76):
-            m = TAIL.match(scan, sp[1])
-            if m and _is_mime_tail(m.group(1)):
-                sp[1] = m.end()
-    return [tuple(x) for x in merged]
+                context.append((s, e))
+    return _join_mime_lines(text, merge_spans(found + context))

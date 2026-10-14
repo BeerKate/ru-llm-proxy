@@ -422,6 +422,12 @@ def merge_results(
         text, valid_results, frozenset(sentence_starts), score_threshold
     )
     decisions.extend(name_decisions)
+    # Declared containers keep their span from the cascade even when the request
+    # excludes their class; they must not be reclassified as BASE64_DATA.
+    declared_containers = [
+        (r.start, r.end) for r in valid_results
+        if (r.recognition_metadata or {}).get("encoded_container") is True
+    ]
     if requested_entities:
         requested = frozenset(requested_entities)
         valid_results = [r for r in valid_results if r.entity_type in requested]
@@ -479,7 +485,8 @@ def merge_results(
     kept.sort(key=lambda result: (result.start, result.end, result.entity_type))
     if logistic_results:
         kept, added_decisions = _add_logistic_coverage(
-            text, kept, logistic_results, requested_entities, score_threshold
+            text, kept, logistic_results, requested_entities, score_threshold,
+            declared_containers,
         )
         decisions.extend(added_decisions)
     return MergeOutcome(tuple(kept), tuple(decisions))
@@ -493,11 +500,14 @@ def _is_logistic_base64(result: RecognizerResult) -> bool:
     )
 
 
-def _add_logistic_coverage(text, native, candidates, requested_entities, score_threshold):
-    """Union new Base64 ranges and subtract retained native spans in a sweep.
+def _add_logistic_coverage(
+    text, native, candidates, requested_entities, score_threshold, declared_containers=(),
+):
+    """Union new Base64 ranges and subtract protected spans in one sorted sweep.
 
-    Native results and types are unchanged. An intersecting container can need
-    several placeholders, whose saved values still restore the original text.
+    Protected spans are retained native results plus declared containers of any
+    class. Native results and types are unchanged. An intersecting container can
+    need several placeholders, whose saved values still restore the original text.
     """
     if requested_entities and "BASE64_DATA" not in requested_entities:
         return native, []
@@ -515,21 +525,25 @@ def _add_logistic_coverage(text, native, candidates, requested_entities, score_t
             )
         else:
             unions.append(result)
+    protected = sorted(
+        [(r.start, r.end, detection_source(r)) for r in native]
+        + [(start, end, SOURCE_STRUCTURAL) for start, end in declared_containers]
+    )
     additions = []
     decisions = []
-    native_index = 0
+    protected_index = 0
     for result in unions:
         cursor = result.start
-        while native_index < len(native) and native[native_index].end <= cursor:
-            native_index += 1
-        index = native_index
-        while index < len(native) and native[index].start < result.end:
-            existing = native[index]
-            if existing.start > cursor:
-                additions.append(_copy_name(result, start=cursor, end=existing.start))
-            cursor = max(cursor, existing.end)
+        while protected_index < len(protected) and protected[protected_index][1] <= cursor:
+            protected_index += 1
+        index = protected_index
+        while index < len(protected) and protected[index][0] < result.end:
+            start, end, source = protected[index]
+            if start > cursor:
+                additions.append(_copy_name(result, start=cursor, end=start))
+            cursor = max(cursor, end)
             decisions.append(MergeDecision(
-                "base64_logistic_native_preserved", detection_source(existing), SOURCE_STRUCTURAL
+                "base64_logistic_native_preserved", source, SOURCE_STRUCTURAL
             ))
             index += 1
         if cursor < result.end:

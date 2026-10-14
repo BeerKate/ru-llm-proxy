@@ -1,4 +1,7 @@
-"""Native Base64 declarations with selectable content or logistic detection."""
+"""Context-first Base64 detection with bounded content inspection.
+
+The optional logistic policy adds a document-level cascade on top of it.
+"""
 
 import base64
 import binascii
@@ -57,7 +60,11 @@ def decode_candidate(value):
 
 
 class Base64DataRecognizer(EntityRecognizer):
-    """Preserve declared spans and select the undeclared-candidate policy."""
+    """Mask declared encodings; infer undeclared ones from sensitive content.
+
+    With the logistic policy, analyze_document() additionally finds Base64 by
+    form, regardless of what it contains.
+    """
 
     def __init__(self, supported_language="ru", policy=None):
         super().__init__(
@@ -70,7 +77,7 @@ class Base64DataRecognizer(EntityRecognizer):
         # Lazy import avoids registry cycles and never includes this recognizer or NER.
         from recognizers import PLAIN_RECOGNIZERS
         self._content_recognizers = [
-            cls() for cls in PLAIN_RECOGNIZERS if self.policy == "content"
+            cls() for cls in PLAIN_RECOGNIZERS
         ]
         from recognizers.credential_rules import (
             AuthTokenRecognizer, LoginRecognizer, PasswordRecognizer, SecretKeyRecognizer,
@@ -87,17 +94,6 @@ class Base64DataRecognizer(EntityRecognizer):
         declared_results = self.analyze_declared(text, self.supported_entities)
         results = [r for r in declared_results if r.entity_type in requested]
         declared = [(r.start, r.end) for r in declared_results]
-
-        if self.policy == "logistic":
-            if "BASE64_DATA" in requested:
-                from recognizers.base64_logistic import find_spans
-
-                for start, end in find_spans(text):
-                    # Native declarations keep their complete span and credential type.
-                    if any(a <= start and end <= b for a, b in declared):
-                        continue
-                    results.append(self._result(start, end, "base64.logistic-cascade"))
-            return EntityRecognizer.remove_duplicates(results)
 
         attempts = 0
         decoded_bytes = 0
@@ -150,10 +146,33 @@ class Base64DataRecognizer(EntityRecognizer):
         return results
 
     def analyze_document(self, text, entities):
-        """Resolve complete source containers before overlapping chunk scans."""
-        if self.policy == "logistic":
-            return self.analyze(text, entities)
-        return self.analyze_declared(text, entities)
+        """Resolve complete source containers before overlapping chunk scans.
+
+        The logistic cascade runs only here: once per document and outside
+        Presidio's per-chunk duplicate removal, whose cost grows with the square
+        of the number of findings. Chunk-level analyze() keeps the content
+        policy, so everything protected by content stays protected.
+        """
+        requested = set(entities or self.supported_entities)
+        declared_results = self.analyze_declared(text, self.supported_entities)
+        results = [r for r in declared_results if r.entity_type in requested]
+        if self.policy != "logistic" or "BASE64_DATA" not in requested:
+            return results
+        from recognizers.base64_logistic import find_spans, merge_spans, subtract_spans
+        from recognizers.json_strings import iter_json_string_values
+
+        spans = find_spans(text)
+        # JSON escapes (\u003d, \") split values in the raw text; scan decoded strings too.
+        for decoded, offsets in iter_json_string_values(text):
+            spans.extend((offsets[start], offsets[end]) for start, end in find_spans(decoded))
+        # Declared values of every type keep their span and class, even when the
+        # request excludes that class.
+        declared = [(r.start, r.end) for r in declared_results]
+        for start, end in subtract_spans(text, merge_spans(spans), declared):
+            results.append(
+                self._result(start, end, "base64.logistic-cascade", encoded_container=False)
+            )
+        return results
 
     def _has_sensitive_content(self, text):
         for recognizer in self._content_recognizers:
@@ -162,7 +181,7 @@ class Base64DataRecognizer(EntityRecognizer):
                 return True
         return False
 
-    def _result(self, start, end, rule, entity_type="BASE64_DATA"):
+    def _result(self, start, end, rule, entity_type="BASE64_DATA", encoded_container=True):
         return RecognizerResult(
             entity_type=entity_type, start=start, end=end, score=0.95,
             recognition_metadata={
@@ -170,6 +189,6 @@ class Base64DataRecognizer(EntityRecognizer):
                 RecognizerResult.RECOGNIZER_IDENTIFIER_KEY: self.id,
                 DETECTION_SOURCE_METADATA_KEY: SOURCE_STRUCTURAL,
                 "deterministic_rule_id": rule,
-                "encoded_container": True,
+                "encoded_container": encoded_container,
             },
         )
