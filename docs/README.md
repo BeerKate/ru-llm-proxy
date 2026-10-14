@@ -65,7 +65,7 @@
 в [отчёте о проверке SSE](research/stream-disconnect.md).
 
 Экспериментальный каскад Base64 с фиксированной логистической регрессией,
-замеры и сравнение с регулярками — в [base64-logistic.md](base64-logistic.md).
+воспроизводимое сравнение с политикой `content` — в [base64-logistic.md](base64-logistic.md).
 
 ## Правила поддержки
 
