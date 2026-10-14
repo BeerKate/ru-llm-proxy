@@ -21,6 +21,9 @@ TARGET_ENTITY_TYPES = frozenset(
         "CONTRACT_NUMBER",
     }
 )
+# Paired context cases also annotate structural recognizers; migration targets
+# and mandatory coverage remain the eight NER classes above.
+ANNOTATION_ENTITY_TYPES = TARGET_ENTITY_TYPES | {"EMAIL_ADDRESS", "HOSTNAME"}
 
 DEFAULT_CORPUS_PATH = Path(__file__).with_name("data") / "ner_migration.jsonl"
 _CASE_ID_RE = re.compile(r"^[a-z][a-z0-9_]*$")
@@ -81,7 +84,7 @@ def parse_annotated_text(annotated_text: str) -> tuple[str, tuple[EntitySpan, ..
 
         entity_type = match.group("entity")
         value = match.group("value")
-        if entity_type not in TARGET_ENTITY_TYPES:
+        if entity_type not in ANNOTATION_ENTITY_TYPES:
             raise ValueError(f"unsupported target entity type: {entity_type}")
         if not value:
             raise ValueError(f"empty value for entity type: {entity_type}")

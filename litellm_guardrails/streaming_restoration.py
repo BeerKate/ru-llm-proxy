@@ -5,9 +5,10 @@ import json
 import re
 from typing import Any, Hashable
 
-import litellm
+from litellm.types.utils import Delta
 from openai.types.responses import (
     ResponseFunctionCallArgumentsDeltaEvent,
+    ResponseIncompleteEvent,
     ResponseReasoningSummaryTextDeltaEvent,
     ResponseRefusalDeltaEvent,
     ResponseTextDeltaEvent,
@@ -27,6 +28,41 @@ def set_field(container: Any, field: str, value: Any) -> None:
         container[field] = value
     else:
         setattr(container, field, value)
+
+
+class ResponsesStreamNormalizer:
+    """Repair Responses envelopes per request, without rewriting their payload."""
+
+    def __init__(self):
+        self._last_sequence = -1
+
+    @staticmethod
+    def prepare(event: Any) -> Any:
+        if (
+            get_field(event, "type") == "response.completed"
+            and get_field(get_field(event, "response"), "status") == "incomplete"
+        ):
+            if isinstance(event, dict):
+                return {**event, "type": "response.incomplete"}
+            # Use the actual SDK subtype so serialization agrees with the event.
+            return ResponseIncompleteEvent.model_construct(
+                **{**dict(event), "type": "response.incomplete"}
+            )
+        return event
+
+    def stamp(self, event: Any) -> Any:
+        kind = get_field(event, "type")
+        if not isinstance(kind, str) or not (
+            kind.startswith("response.") or kind == "error"
+        ):
+            return event
+        sequence = get_field(event, "sequence_number")
+        if type(sequence) is not int or sequence <= self._last_sequence:
+            sequence = self._last_sequence + 1
+        # Some bridge events attach the number outside serializable model fields.
+        set_field(event, "sequence_number", sequence)
+        self._last_sequence = sequence
+        return event
 
 
 class _StreamingPlaceholderReplacer:
@@ -271,7 +307,7 @@ class StreamingResponseRestorer:
         for call in calls:
             if get_field(call, "index") == key[3]:
                 return get_field(call, "function"), "arguments"
-        call = litellm.Delta(
+        call = Delta(
             tool_calls=[{"index": key[3], "function": {"arguments": ""}}]
         ).tool_calls[0]
         calls.append(call)
@@ -282,7 +318,7 @@ class StreamingResponseRestorer:
             index = get_field(choice, "index") or 0
             delta = get_field(choice, "delta")
             if delta is None:
-                delta = {} if isinstance(choice, dict) else litellm.Delta()
+                delta = {} if isinstance(choice, dict) else Delta()
                 set_field(choice, "delta", delta)
             targets = []
             for field in ("content", "reasoning_content"):

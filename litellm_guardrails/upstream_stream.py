@@ -265,6 +265,28 @@ class UpstreamStreamAdapter(CustomLogger):
     async def async_pre_call_deployment_hook(self, kwargs, call_type):
         kind = getattr(call_type, "value", call_type)
         openai_route = kwargs.get("custom_llm_provider") == "openai" or str(kwargs.get("model", "")).startswith("openai/")
+        bridge = kind == "aresponses" and openai_route and (
+            bool(kwargs.get("use_chat_completions_api"))
+            or str(kwargs.get("model", "")).startswith("openai/chat_completions/")
+        )
+        if bridge:
+            code = param = message = None
+            if kwargs.get("previous_response_id") is not None:
+                code = "responses_chat_bridge_history_unsupported"
+                param = "previous_response_id"
+                message = "The Responses-to-Chat bridge requires full visible history without previous_response_id."
+            elif kwargs.get("stream") and isinstance(kwargs.get("tool_choice"), dict) and kwargs["tool_choice"].get("type") == "function":
+                code = "responses_chat_bridge_named_tool_unsupported"
+                param = "tool_choice"
+                message = "Named tool selection is unsupported by the streaming Responses-to-Chat bridge. Use Chat Completions, non-streaming Responses, or required with a single tool."
+            if code:
+                _log("upstream_responses_bridge_rejected", reason=code, request_id=transport_request_id(kwargs))
+                raise litellm.BadRequestError(
+                    message=f"{code}: {message}", model=kwargs.get("model", ""), llm_provider="openai",
+                    body={"message": message, "type": "invalid_request_error", "param": param, "code": code},
+                )
+            # The stock bridge invokes acompletion, where the real Chat client is injected.
+            return kwargs
         if not kwargs.get("stream") or kind not in {"acompletion", "aresponses"} or not openai_route:
             return kwargs
         key = transport_request_id(kwargs)

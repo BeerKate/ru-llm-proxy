@@ -22,6 +22,16 @@ CONTEXT_CORPUS = DEFAULT_CORPUS_PATH.with_name("name_context_regressions.jsonl")
 FIELD_HOLDOUT_CORPUS = DEFAULT_CORPUS_PATH.with_name("name_field_holdout.jsonl")
 NAME_TYPES = frozenset({"PERSON", "ORGANIZATION"})
 # Model limitations remain explicit; these are not exemptions in production code.
+INSTRUCTION_EXACT_LIMITATIONS = {
+    "dialogue_role_email": {
+        "text": (
+            "<example>\nuser: what is the email dialogue-contact@example.test?\n"
+            "assistant: Done.\n</example>"
+        ),
+        "expected_spans": frozenset({("EMAIL_ADDRESS", 34, 63)}),
+        "extra_spans": frozenset({("PERSON", 76, 80)}),
+    },
+}
 NAME_EXACT_LIMITATIONS = {
     "person_uppercase": (["PERSON"], ["ORGANIZATION"]),
 }
@@ -31,6 +41,26 @@ CONTEXT_EXACT_LIMITATIONS = {
 # The original control exposed a header boundary regression. Its annotation is
 # unchanged and must now pass exactly; it is no longer an independent control.
 FIELD_HOLDOUT_EXACT_LIMITATIONS = {}
+
+
+def _check_instruction_exact_spans(case, results):
+    expected = {(e.entity_type, e.start, e.end) for e in case.expected}
+    actual = {(r["entity_type"], r["start"], r["end"]) for r in results}
+    extra = actual - expected
+    limitation = INSTRUCTION_EXACT_LIMITATIONS.get(case.case_id)
+    if limitation is not None:
+        assert (
+            case.text == limitation["text"]
+            and expected == limitation["expected_spans"]
+            and case.score_threshold == 0.35
+        ), f"{case.case_id}: accepted limitation no longer matches source annotation"
+        allowed_extra = limitation["extra_spans"]
+    else:
+        allowed_extra = frozenset()
+    assert expected <= actual and extra <= allowed_extra, (
+        f"{case.case_id}: command or credential changed"
+    )
+    return sorted(extra)
 
 
 def _name_cases():
@@ -170,14 +200,37 @@ def check_entity_filters(analyzer_url):
     return len(cases) + len(examples)
 
 
-def check_instructions(analyzer_url, proxy_url, capture_url):
+def check_instructions(analyzer_url, proxy_url, block_proxy_url, capture_url):
     entity_filter_cases = check_entity_filters(analyzer_url)
     cases = load_corpus(CORPUS)
     client = AnalyzerClient(analyzer_url, timeout_seconds=60)
     predictions = {case.case_id: client.analyze(case) for case in cases}
     metrics = evaluate_predictions(cases, predictions)
+    observed_limitations = {}
     for case in cases:
         results = predictions[case.case_id]
+        if "instruction_login_context" in case.tags:
+            expected_spans = {(e.entity_type, e.start, e.end) for e in case.expected}
+            extra = _check_instruction_exact_spans(case, results)
+            if extra:
+                observed_limitations[case.case_id] = extra
+            filtered = _request(
+                analyzer_url, "/api/v1/analyze",
+                {"text": case.text, "entities": ["LOGIN"], "score_threshold": 0.35},
+            )["entities"]
+            filtered_spans = {
+                (r["entity_type"], r["start"], r["end"]) for r in filtered
+            }
+            # A selective filter can expose a different BERT type for an email
+            # or hostname. Preserve that accepted limitation, never the command.
+            assert {span for span in expected_spans if span[0] == "LOGIN"} <= filtered_spans
+            assert all(
+                r["entity_type"] == "LOGIN"
+                and any(e.start <= r["start"] < r["end"] <= e.end for e in case.expected)
+                for r in filtered
+            ), (
+                f"{case.case_id}: LOGIN filter changed command or credential"
+            )
         if not case.expected:
             assert not results, f"{case.case_id}: unexpected masking"
         for expected in case.expected:
@@ -188,6 +241,7 @@ def check_instructions(analyzer_url, proxy_url, capture_url):
     assert metrics["aggregate"]["critical_coverage_recall"] == 1.0
 
     flows = 0
+    login_block_flows = 0
     for case in cases:
         for api in ("chat/completions", "responses"):
             for stream in (False, True):
@@ -216,6 +270,23 @@ def check_instructions(analyzer_url, proxy_url, capture_url):
                 ], f"{case.case_id}: sensitive egress"
                 assert capture["provider_saw_pii_placeholder"] == bool(case.expected)
                 flows += 1
+                if "instruction_login_context" not in case.tags:
+                    continue
+                _request(capture_url, "/capture/reset", {})
+                if case.expected:
+                    try:
+                        _request(block_proxy_url, "/v1/" + api, payload, stream=stream)
+                    except urllib.error.HTTPError as error:
+                        assert error.code == 422, f"{case.case_id}: unexpected block status"
+                    else:
+                        raise AssertionError(f"{case.case_id}: sensitive input not blocked")
+                else:
+                    response = _request(block_proxy_url, "/v1/" + api, payload, stream=stream)
+                    assert _restored_text(response, api, stream) == case.text
+                with urllib.request.urlopen(capture_url + "/capture", timeout=5) as captured:
+                    capture = json.load(captured)
+                assert capture["provider_requests"] == (0 if case.expected else 1)
+                login_block_flows += 1
     print(
         json.dumps(
             {
@@ -223,12 +294,59 @@ def check_instructions(analyzer_url, proxy_url, capture_url):
                 "analyzer_cases": len(cases),
                 "entity_filter_cases": entity_filter_cases,
                 "echo_flows": flows,
+                "login_block_flows": login_block_flows,
                 "holdout_cases": sum("holdout" in case.tags for case in cases),
+                "accepted_exact_limitations": observed_limitations,
                 "metrics": metrics["aggregate"],
             },
             sort_keys=True,
         )
     )
+
+
+def check_dialogue_arguments(proxy_url, block_proxy_url, capture_url):
+    from dkb_corpus_checks import payload_for
+
+    cases = [case for case in load_corpus(CORPUS) if "dialogue" in case.tags]
+    flows = blocked = clean = 0
+    for case in cases:
+        for api in ("chat/completions", "responses"):
+            for stream in (False, True):
+                payload = payload_for(case.text, api, stream, arguments=True)
+                _request(capture_url, "/capture/reset", {})
+                response = _request(proxy_url, "/v1/" + api, payload, stream=stream)
+                assert _restored_text(response, api, stream) == case.text, (
+                    case.case_id, api, stream, "dialogue argument restoration changed"
+                )
+                with urllib.request.urlopen(capture_url + "/capture", timeout=5) as captured:
+                    result = json.load(captured)
+                assert result["provider_requests"] == 1
+                assert not result["provider_saw_canary"], case.case_id
+                assert result["provider_saw_pii_placeholder"] == bool(case.expected), (
+                    case.case_id, api, stream, "unexpected masking of dialogue arguments"
+                )
+                flows += 1
+                _request(capture_url, "/capture/reset", {})
+                if case.expected:
+                    try:
+                        _request(block_proxy_url, "/v1/" + api, payload, stream=stream)
+                    except urllib.error.HTTPError as error:
+                        assert error.code == 422, (case.case_id, error.code)
+                    else:
+                        raise AssertionError((case.case_id, "sensitive dialogue arguments not blocked"))
+                    expected_requests = 0
+                    blocked += 1
+                else:
+                    response = _request(block_proxy_url, "/v1/" + api, payload, stream=stream)
+                    assert _restored_text(response, api, stream) == case.text
+                    expected_requests = 1
+                    clean += 1
+                with urllib.request.urlopen(capture_url + "/capture", timeout=5) as captured:
+                    result = json.load(captured)
+                assert result["provider_requests"] == expected_requests
+                assert not result["provider_saw_canary"]
+    print(json.dumps({"status": "ok", "dialogue_argument_cases": len(cases),
+                      "echo_flows": flows, "blocked_flows": blocked, "clean_block_flows": clean}))
 
 
 def check_names(
@@ -380,7 +498,8 @@ def main():
         (args.analyzer_url, args.proxy_url, args.block_proxy_url, args.capture_url)
     ):
         parser.error("Analyzer, mask/block proxy and capture URLs are required")
-    check_instructions(args.analyzer_url, args.proxy_url, args.capture_url)
+    check_dialogue_arguments(args.proxy_url, args.block_proxy_url, args.capture_url)
+    check_instructions(args.analyzer_url, args.proxy_url, args.block_proxy_url, args.capture_url)
     check_names(
         args.analyzer_url, args.proxy_url, args.block_proxy_url, args.capture_url
     )

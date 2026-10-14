@@ -1,6 +1,6 @@
 # Примеры API
 
-Примеры рассчитаны на LiteLLM по адресу `localhost:4000`, модель `glm-5.2` и
+Примеры рассчитаны на LiteLLM по адресу `localhost:4000`, модель `glm-5.3-flash` и
 пользовательский ключ прокси. Настройки окружения описаны в
 [configuration.md](configuration.md), правила выдачи ключей — в
 [admin-access.md](admin-access.md).
@@ -28,7 +28,7 @@ curl -s "$API_URL/v1/chat/completions" \
   -H "Authorization: Bearer $RU_LLM_PROXY_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "glm-5.2",
+    "model": "glm-5.3-flash",
     "messages": [{
       "role": "user",
       "content": "Клиент Иванов Иван, телефон +79031234567, ИНН 7707083893. Составь краткую справку."
@@ -44,7 +44,11 @@ curl -s "$API_URL/v1/chat/completions" \
 ```
 
 Значения восстанавливаются, только если модель вернула служебные метки без
-изменений.
+изменений. Прокси не угадывает удалённые значения и не исправляет ответ модели:
+адрес внутри пояснения не равнозначен ответу только адресом, а восстановленный
+текст не заменяет отсутствующий вызов инструмента. Задания, требующие прочитать
+содержимое скрытого значения (например, определить домен адреса), в режиме
+маскирования не могут опираться на эти данные.
 
 ### Потоковый ответ
 
@@ -53,7 +57,7 @@ curl -sS "$API_URL/v1/chat/completions" \
   -H "Authorization: Bearer $RU_LLM_PROXY_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "glm-5.2",
+    "model": "glm-5.3-flash",
     "stream": true,
     "guardrails": ["ru-pii-mask-pre", "ru-pii-mask-post"],
     "messages": [{"role":"user","content":"Проверь телефон +79031234567"}]
