@@ -346,9 +346,12 @@ def _join_mime_lines(text: str, spans) -> list[tuple[int, int]]:
             if m:
                 line = m.group(1)
                 block = re.sub(r"[^A-Za-z0-9+/=]", "", text[start:end].replace("\\n", "").replace("\\r", "")) + line
-                # Обычное слово на следующей строке (UserName, HelloWorld) — не хвост:
-                # у хвоста есть паддинг, цифра или символ +/.
-                if (line.endswith("=") or any(c in "+/0123456789" for c in line)) and _valid_block_length(block):
+                # Обычное слово на следующей строке (UserName, HelloWorld) — не хвост: у хвоста
+                # есть паддинг, цифра или +/, а хвост из одних букв должен выглядеть случайным
+                # (слабый признак, как для длинных строк; у слов оценка ниже -6).
+                looks_encoded = line.endswith("=") or any(c in "+/0123456789" for c in line) or (
+                    len(line) >= 4 and randomness_score(line) > -3.0)
+                if looks_encoded and _valid_block_length(block):
                     end = m.end(1)
         out.append((start, end))
     return out

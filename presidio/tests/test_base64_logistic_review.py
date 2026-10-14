@@ -101,6 +101,14 @@ def test_real_mime_block_is_fully_covered(width, newline, size):
     assert find_spans(text) == [(start, start + len(block))]
 
 
+@pytest.mark.parametrize("tail", ["VLBCAnSLGHYhKRKU", "jdDKcNAGuxevYAwv", "yeavRBaLaohUNxziBsdg"])
+def test_letters_only_mime_tail_is_covered(tail):
+    body = mime(bytes((i * 29 + 3) % 256 for i in range(57 * 4)), 76)
+    text = "Вложение:\n" + body + "\n" + tail + "\n\nКонец."
+    start = text.index(body)
+    assert find_spans(text) == [(start, start + len(body) + 1 + len(tail))]
+
+
 def test_json_escaped_mime_block_is_fully_covered():
     block = mime(bytes((i * 53 + 7) % 256 for i in range(400)), 76)
     text = json.dumps({"attachment": block})
