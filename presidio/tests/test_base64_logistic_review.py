@@ -173,3 +173,86 @@ def test_merge_is_idempotent_with_partial_overlap():
     assert [(r.start, r.end, r.entity_type) for r in both] == [
         (0, 5, "BASE64_DATA"), (5, 15, "AUTH_TOKEN"), (15, 50, "BASE64_DATA")
     ]
+
+
+# --- Second review: MIME tails versus identifiers with digits --------------------------------
+
+FULL_LINE = b64((('password="Synthetic-Pass-2026"' + " " * 48)[:48]).encode())
+IDENTIFIERS_WITH_DIGITS = [
+    # word + number
+    "Version2", "Default2", "Return42", "Section2", "Figure12", "ResNet50", "Release2026", "Python312",
+    "Chapter10", "Build4521", "Item007", "Layer12", "Test123", "Model3", "README1", "Table3",
+    # abbreviations and protocol or codec names
+    "H264", "IPv6", "A1B2", "HTTP2", "TLS13", "MySQL8", "GPT4o", "UTF16", "OAuth2", "i18n", "l10n", "Web3",
+    # lowercase identifiers, hex digests
+    "user42", "page2", "utf8", "sha256", "node18", "8827e1b2", "deadbeef12345678",
+]
+
+
+@pytest.mark.parametrize("word", IDENTIFIERS_WITH_DIGITS)
+@pytest.mark.parametrize("newline", ["\n", "\r\n"])
+def test_identifier_with_digits_after_full_line_is_not_captured(api, word, newline):
+    for width in (64, 76):
+        line = (FULL_LINE * 2)[:width]
+        assert spans(api, line + newline + word) == [("BASE64_DATA", 0, width)]
+
+
+@pytest.mark.parametrize("word", IDENTIFIERS_WITH_DIGITS)
+def test_identifier_with_digits_after_full_line_in_json_is_not_captured(api, word):
+    text = json.dumps({"attachment": FULL_LINE + "\n" + word})
+    start = text.index(FULL_LINE)
+    assert spans(api, text) == [("BASE64_DATA", start, start + len(FULL_LINE))]
+
+
+@pytest.mark.parametrize("tail", ["Qr3yIQbw", "d2Lw88tNdk3H", "ByBRFZoPifLG2srj", "uzESRf1v", "QUJDRA==", "QUI=", "a+b/"])
+@pytest.mark.parametrize("newline", ["\n", "\r\n"])
+def test_real_short_tail_is_covered_through_api(api, tail, newline):
+    text = "Вложение:\n" + FULL_LINE + newline + tail + "\nКонец."
+    start = text.index(FULL_LINE)
+    end = start + len(FULL_LINE) + len(newline) + len(tail)
+    found = spans(api, text)
+    # The block may be split where the content policy already masks the first line.
+    assert all(start <= s and e <= end and kind == "BASE64_DATA" for kind, s, e in found)
+    assert {i for _, s, e in found for i in range(s, e)} >= set(range(start, start + len(FULL_LINE))) | set(range(end - len(tail), end))
+
+
+# --- Second review: declared keys written with JSON escapes ----------------------------------
+
+TYPED_KEYS = [("password_base64", "PASSWORD"), ("secret_key_base64", "SECRET_KEY"), ("login_base64", "LOGIN"),
+              ("auth_token_base64", "AUTH_TOKEN"), ("api_key_base64", "SECRET_KEY"), ("document_base64", "BASE64_DATA")]
+VALUE = b64(b"Synthetic-Password-2026")
+
+
+def escaped_keys(key):
+    """The plain key and spellings with one letter written as a JSON \\uXXXX escape."""
+    yield key
+    for index in (0, key.index("base64")):
+        yield key[:index] + "\\u%04x" % ord(key[index]) + key[index + 1:]
+
+
+def documents(key, value=VALUE):
+    yield '{"%s":"%s"}' % (key, value)
+    yield '{"outer":{"%s":"%s"},"note":"x"}' % (key, value)
+    yield '[{"other":1},{"%s":"%s"}]' % (key, value)
+
+
+@pytest.mark.parametrize("key,kind", TYPED_KEYS)
+def test_escaped_declared_key_keeps_class_and_filter(api, key, kind):
+    for spelling in escaped_keys(key):
+        for text in documents(spelling):
+            start = text.index(VALUE)
+            value = (start, start + len(VALUE))
+            assert (kind, *value) in spans(api, text, ["BASE64_DATA", kind])
+            excluded = spans(api, text, ["BASE64_DATA"])
+            if kind == "BASE64_DATA":
+                assert excluded == [("BASE64_DATA", *value)]
+            else:
+                assert excluded == []
+
+
+def test_escaped_key_and_escaped_value_keep_offsets(api):
+    escaped_value = "\\u%04x" % ord(VALUE[0]) + VALUE[1:]
+    text = '{"password_b\\u0061se64":"%s"}' % escaped_value
+    start = text.index(escaped_value)
+    assert spans(api, text, ["BASE64_DATA", "PASSWORD"]) == [("PASSWORD", start, start + len(escaped_value))]
+    assert spans(api, text, ["BASE64_DATA"]) == []

@@ -33,6 +33,7 @@ _CONTEXT = re.compile(
     r"(?:\r?\n[ \t]*)?[^\s\"',;}\]]+"
     r"(?:\r?\n[ \t]+[A-Za-z0-9_+/-]+={0,2}(?=[ \t]*(?:\r?\n|$)))*)"
 )
+_DECLARED_KEY = re.compile(rf"(?i){_KEY}")
 _CANDIDATE = re.compile(
     r"(?<![\w+/=-])[A-Za-z0-9_+/-]{8,}={0,2}(?![\w+/=-])"
 )
@@ -135,14 +136,32 @@ class Base64DataRecognizer(EntityRecognizer):
             while end > start and text[end - 1].isspace():
                 end -= 1
             if start < end:
-                key = re.sub(r"[_-](?:base64|b64)$", "", match.group("key"), flags=re.I)
-                entity_type = "BASE64_DATA"
-                for recognizer in self._typed_recognizers:
-                    if recognizer.analyze(f'{key}="synthetic-value-123"', recognizer.supported_entities):
-                        entity_type = recognizer.supported_entities[0]
-                        break
+                entity_type = self._declared_type(match.group("key"))
                 if entity_type in requested:
                     results.append(self._result(start, end, "base64.declared", entity_type))
+        return results
+
+    def _declared_type(self, key):
+        """Class of a declared value: credential type from the key name, else BASE64_DATA."""
+        key = re.sub(r"[_-](?:base64|b64)$", "", key, flags=re.I)
+        for recognizer in self._typed_recognizers:
+            if recognizer.analyze(f'{key}="synthetic-value-123"', recognizer.supported_entities):
+                return recognizer.supported_entities[0]
+        return "BASE64_DATA"
+
+    def _declared_json_members(self, text):
+        """Declared values whose JSON key matches after decoding escapes, e.g. password_b\\u0061se64."""
+        from recognizers.json_strings import iter_json_keyed_strings
+
+        results = []
+        for key, decoded, offsets in iter_json_keyed_strings(text):
+            if not isinstance(key, str) or not _DECLARED_KEY.fullmatch(key) or not decoded.strip():
+                continue
+            first = len(decoded) - len(decoded.lstrip())
+            last = len(decoded.rstrip())
+            results.append(self._result(
+                offsets[first], offsets[last], "base64.declared-json", self._declared_type(key)
+            ))
         return results
 
     def analyze_document(self, text, entities):
@@ -155,6 +174,12 @@ class Base64DataRecognizer(EntityRecognizer):
         """
         requested = set(entities or self.supported_entities)
         declared_results = self.analyze_declared(text, self.supported_entities)
+        if self.policy == "logistic":
+            # Keys written with JSON escapes declare the same value as plain keys; the
+            # decoded key decides the class even where the raw-text rule saw a key such as u0070assword_base64.
+            members = self._declared_json_members(text)
+            spans = {(r.start, r.end) for r in members}
+            declared_results = [r for r in declared_results if (r.start, r.end) not in spans] + members
         results = [r for r in declared_results if r.entity_type in requested]
         if self.policy != "logistic" or "BASE64_DATA" not in requested:
             return results

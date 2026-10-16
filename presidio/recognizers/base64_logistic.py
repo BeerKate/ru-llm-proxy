@@ -319,10 +319,20 @@ def _overlaps(intervals, starts, s, e) -> bool:
     return i >= 0 and intervals[i][1] > s
 
 
-def _valid_block_length(chars: str) -> bool:
-    core = chars.rstrip("=")
-    pad = len(chars) - len(core)
-    return len(core) % 4 != 1 and (not pad or len(chars) % 4 == 0)
+def _is_mime_tail(line: str) -> bool:
+    """Короткая последняя строка MIME/PEM-блока или обычная строка после него.
+
+    Полные строки блока кратны 4 и блок дополнен "=", поэтому длина хвоста вместе с "="
+    кратна 4: это отсекает Model3, README1, TLS13. Дальше нужен признак кодировки:
+    паддинг, "+" или "/" (не путь), или случайный вид по оценке каскада — только от
+    8 символов, потому что на коротких строках оценка ненадёжна (H264, IPv6, i18n).
+    Компромисс: хвост из 4 букв и цифр без "=" (до 3 байт) не присоединяется.
+    """
+    if len(line) % 4 or HEX.fullmatch(line):
+        return False
+    if line.endswith("=") or (("+" in line or "/" in line) and not _looks_like_path(line)):
+        return True
+    return len(line) >= 8 and randomness_score(line) > -3.0
 
 
 def _join_mime_lines(text: str, spans) -> list[tuple[int, int]]:
@@ -346,12 +356,7 @@ def _join_mime_lines(text: str, spans) -> list[tuple[int, int]]:
             if m:
                 line = m.group(1)
                 block = re.sub(r"[^A-Za-z0-9+/=]", "", text[start:end].replace("\\n", "").replace("\\r", "")) + line
-                # Обычное слово на следующей строке (UserName, HelloWorld) — не хвост: у хвоста
-                # есть паддинг, цифра или +/, а хвост из одних букв должен выглядеть случайным
-                # (слабый признак, как для длинных строк; у слов оценка ниже -6).
-                looks_encoded = line.endswith("=") or any(c in "+/0123456789" for c in line) or (
-                    len(line) >= 4 and randomness_score(line) > -3.0)
-                if looks_encoded and _valid_block_length(block):
+                if _is_mime_tail(line) and len(block) % 4 == 0:
                     end = m.end(1)
         out.append((start, end))
     return out

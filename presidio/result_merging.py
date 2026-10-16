@@ -548,7 +548,17 @@ def _add_logistic_coverage(
             index += 1
         if cursor < result.end:
             additions.append(_copy_name(result, start=cursor))
-    return sorted([*native, *additions], key=lambda r: (r.start, r.end, r.entity_type)), decisions
+    # A remainder next to a native span must not start or end with a line break or spaces.
+    trimmed = []
+    for addition in additions:
+        start, end = addition.start, addition.end
+        while start < end and text[start].isspace():
+            start += 1
+        while end > start and text[end - 1].isspace():
+            end -= 1
+        if start < end:
+            trimmed.append(_copy_name(addition, start=start, end=end))
+    return sorted([*native, *trimmed], key=lambda r: (r.start, r.end, r.entity_type)), decisions
 
 
 def _copy_name(

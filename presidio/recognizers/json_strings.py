@@ -16,6 +16,7 @@ from recognizers.credential_rules import (
 MAX_JSON_CHARS = 65536
 _STRING = re.compile(r'"(?:[^"\\]|\\.)*"', re.S)
 _KEY_SEPARATOR = re.compile(r"\s*:")
+_MEMBER_SEPARATOR = re.compile(r"\s*:\s*")
 
 
 def _reject_json_constant(value):
@@ -34,6 +35,26 @@ def iter_json_string_values(text):
         if _KEY_SEPARATOR.match(text, match.end()):
             continue
         yield decoded_string_offsets(text, match.start(), match.end())
+
+
+def iter_json_keyed_strings(text):
+    """Yield decoded key, decoded value and value offsets for string object members."""
+    if len(text) > MAX_JSON_CHARS or not text.lstrip().startswith(("{", "[", '"')):
+        return
+    try:
+        json.loads(text, parse_constant=_reject_json_constant)
+    except (ValueError, RecursionError):
+        return
+    key = None
+    value_start = None
+    for match in _STRING.finditer(text):
+        separator = _MEMBER_SEPARATOR.match(text, match.end())
+        if separator:
+            key = json.loads(match.group())
+            value_start = separator.end()
+            continue
+        if match.start() == value_start:
+            yield (key, *decoded_string_offsets(text, match.start(), match.end()))
 
 
 def decoded_string_offsets(text, start, end):
