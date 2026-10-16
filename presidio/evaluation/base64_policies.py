@@ -233,11 +233,32 @@ def worker(policy, data_path):
     print(json.dumps(report, ensure_ascii=False))
 
 
-def _category(value):
-    core = re.sub(r"\s", "", value)
+def canonical_decode(value):
+    """Bytes of canonical standard or URL-safe Base64, padding optional, else None.
+
+    Whitespace (line breaks of MIME blocks) is ignored. Existing "=" must be exactly
+    the padding the length requires; re-encoding must reproduce the input, so values
+    with non-zero trailing bits (``YR``) or mixed alphabets are not canonical.
+    """
+    compact = re.sub(r"\s", "", value)
+    core = compact.rstrip("=")
+    padding = len(compact) - len(core)
+    if not core or len(core) % 4 == 1 or padding not in (0, -len(core) % 4):
+        return None
+    urlsafe = "-" in core or "_" in core
+    if urlsafe and ("+" in core or "/" in core):
+        return None
     try:
-        raw = base64.b64decode(core + "=" * (-len(core.rstrip("=")) % 4), altchars=b"-_", validate=True)
+        raw = base64.b64decode(core + "=" * (-len(core) % 4), altchars=b"-_" if urlsafe else None, validate=True)
     except (binascii.Error, ValueError):
+        return None
+    encoded = (base64.urlsafe_b64encode if urlsafe else base64.b64encode)(raw).decode().rstrip("=")
+    return raw if encoded == core else None
+
+
+def _category(value):
+    raw = canonical_decode(value)
+    if raw is None:
         return "not canonical Base64"
     try:
         text = raw.decode("utf-8")
