@@ -41,8 +41,6 @@ def context_engine(request):
         if case.case_id
         in {
             "kpp",
-            "address_bare",
-            "address_multiword",
             "inn",
             "bik",
             "passport_foreign",
@@ -57,3 +55,17 @@ def test_context_dependency_is_explicit(context_engine, case):
     results = engine.analyze(case.text, language="ru", score_threshold=0.35)
     row = check_context_case(case, [result.to_dict() for result in results])
     assert row["typed_covered"] is (variant != "c")
+
+
+@pytest.mark.parametrize(
+    "case",
+    [case for case in CONTEXT_CASES if case.case_id in {"address_bare", "address_multiword"}],
+    ids=lambda case: case.case_id,
+)
+def test_street_and_house_chain_needs_no_context(context_engine, case):
+    # RuAddressChainRecognizer accepts a street with a house number by shape,
+    # so these addresses no longer depend on lemma context words.
+    _, engine = context_engine
+    results = engine.analyze(case.text, language="ru", score_threshold=0.35)
+    row = check_context_case(case, [result.to_dict() for result in results])
+    assert row["typed_covered"] is True
