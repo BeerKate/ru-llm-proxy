@@ -18,6 +18,7 @@ from presidio_analyzer import RecognizerResult
 from result_merging import (
     DETECTION_SOURCE_METADATA_KEY,
     NER_MODEL_METADATA_KEY,
+    NER_NAME_WORD_PIECES_KEY,
     SOURCE_NER,
     name_context_evidence,
 )
@@ -1342,6 +1343,11 @@ class HuggingFaceNERRecognizer:
                     recognition_metadata={
                         DETECTION_SOURCE_METADATA_KEY: SOURCE_NER,
                         NER_MODEL_METADATA_KEY: self._profile.model_id,
+                        **(
+                            {NER_NAME_WORD_PIECES_KEY: True}
+                            if self._profile.drop_name_word_pieces
+                            else {}
+                        ),
                     },
                 )
             )

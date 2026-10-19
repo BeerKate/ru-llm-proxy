@@ -49,6 +49,9 @@ class NERModelProfile:
     o_logit_bias: float
     span_postprocessing: str
     spacy_disabled_pipes: tuple[str, ...] = ()
+    # Drop model names that end or start inside a Latin word (Don|e); see
+    # result_merging.NER_NAME_WORD_PIECES_KEY.
+    drop_name_word_pieces: bool = False
 
 
 PROFILES: dict[str, NERModelProfile] = {
@@ -75,6 +78,7 @@ PROFILES: dict[str, NERModelProfile] = {
         o_logit_bias=1.0,
         span_postprocessing=SPAN_POSTPROCESSING_SECRETS_CONTRACTS,
         spacy_disabled_pipes=SPACY_LEMMA_ONLY_DISABLED,
+        drop_name_word_pieces=True,
     ),
 }
 DEFAULT_PROFILE = "bert"
