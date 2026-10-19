@@ -30,6 +30,9 @@ SPAN_POSTPROCESSING_MODES = frozenset(
     }
 )
 MAX_O_LOGIT_BIAS = 10.0
+# spaCy components a profile can drop when its weights replace spaCy NER; the
+# tokenizer and lemmatizer stay because recognizer context words need lemmas.
+SPACY_LEMMA_ONLY_DISABLED = ("tok2vec", "morphologizer", "parser", "attribute_ruler", "ner")
 
 
 class ModelProfileError(ValueError):
@@ -45,6 +48,7 @@ class NERModelProfile:
     directory: Path
     o_logit_bias: float
     span_postprocessing: str
+    spacy_disabled_pipes: tuple[str, ...] = ()
 
 
 PROFILES: dict[str, NERModelProfile] = {
@@ -70,6 +74,7 @@ PROFILES: dict[str, NERModelProfile] = {
         directory=Path("/opt/models/rubert-tiny2-secret-detection"),
         o_logit_bias=1.0,
         span_postprocessing=SPAN_POSTPROCESSING_SECRETS_CONTRACTS,
+        spacy_disabled_pipes=SPACY_LEMMA_ONLY_DISABLED,
     ),
 }
 DEFAULT_PROFILE = "bert"

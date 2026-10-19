@@ -29,6 +29,7 @@ from recognizers.base64_data import Base64DataRecognizer
 from result_merging import MergeDecision, merge_results
 from text_chunking import TextChunk, plan_text_chunks
 from ner import (
+    ACTIVE_PROFILE,
     MODEL_ID,
     MODEL_REVISION,
     HuggingFaceNERRecognizer,
@@ -454,6 +455,12 @@ nlp_engine_provider = NlpEngineProvider(
     }
 )
 nlp_engine = nlp_engine_provider.create_engine()
+# A profile fine-tuned to replace spaCy NER keeps only the spaCy components
+# that context words need; a missing component fails startup explicitly.
+for spacy_pipe in ACTIVE_PROFILE.spacy_disabled_pipes:
+    if spacy_pipe not in nlp_engine.nlp["ru"].pipe_names:
+        raise RuntimeError(f"spaCy component {spacy_pipe!r} is not in the ru model")
+    nlp_engine.nlp["ru"].disable_pipe(spacy_pipe)
 analyzer = AnalyzerEngine(nlp_engine=nlp_engine)
 
 # The specialized BERT owns these types: generic spaCy predictions otherwise
