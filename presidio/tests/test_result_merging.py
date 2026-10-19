@@ -270,6 +270,12 @@ def test_inert_ner_credential_values_are_suppressed(entity_type, text, value):
         ("Agreement no. AG-2026-0044 was signed.", "AG-2026-0044"),
         ("Номер\u00a0договора из PDF: ДГ-2026\u00ad/117.", "ДГ-2026\u00ad/117"),
         ("Номер договора:\nML-2026/0091 указан в форме.", "ML-2026/0091"),
+        ('{"contract_id": "AB-2024/17"}', "AB-2024/17"),
+        ("contract_number = 'CN-88-2026'", "CN-88-2026"),
+        ('номер_договора = "77-И/2025"', "77-И/2025"),
+        ("client_contract_no=DG-2026-0042", "DG-2026-0042"),
+        ("contractNumber: DG-2026-0042", "DG-2026-0042"),
+        ("agreement_ref: AG/2026/7781", "AG/2026/7781"),
     ],
 )
 def test_contract_ner_result_requires_and_accepts_context_evidence(text, value):
@@ -320,6 +326,12 @@ def test_contract_context_confirms_repeated_numbers_in_same_sentence():
         ("Шаблон договора DEMO-2026/01 опубликован.", "DEMO-2026/01"),
         ("Договор подписан 12.07.2026 сторонами.", "12.07.2026"),
         ("У договора версия 2.4.1 используется в тестах.", "2.4.1"),
+        ("contractor_id: AB-2024/17", "AB-2024/17"),
+        ("build_id: AB-2024/17", "AB-2024/17"),
+        ("contractNotes: AB-2024/17", "AB-2024/17"),
+        ("get_txs(contract_address, start_block=27619770)", "27619770"),
+        ('hashes(API_KEY, TOKEN_CONTRACT, "9f3Kq77Lm2Xp")', "9f3Kq77Lm2Xp"),
+        ("CONTRACT_NUMBER, один проход, LR 1e-6 и epoch-4", "epoch-4"),
     ],
 )
 def test_unconfirmed_contract_ner_result_is_suppressed(text, value):

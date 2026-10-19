@@ -75,6 +75,14 @@ _CONTRACT_CONTEXT_RE = re.compile(
     r"соглашени(?:е|я|ю|ем|и|й|ям|ями|ях)|"
     r"contracts?|agreements?"
     r")(?![\w])"
+    # Identifier keys with an explicit number suffix (contract_id,
+    # contractNumber, client_contract_no, номер_договора) followed by an
+    # assignment. A bare contract_* key such as contract_address in
+    # smart-contract code, or a type name in prose, is not enough.
+    r"|(?<![^\W_])(?:contract|agreement)s?[_\-.]?(?:id|no|nr|num|number|ref)"
+    r"(?![a-z])(?=[\"'`]?[ \t]*[:=])"
+    r"|(?<![^\W_])(?:номер_договор\w*|nomer_dogovora|"
+    r"dogovora?[_\-.]?(?:id|no|nr|num|nomer|number))(?![a-z])(?=[\"'`]?[ \t]*[:=])"
 )
 _CONTRACT_CANDIDATE_RE = re.compile(
     r"(?<![\w])"
