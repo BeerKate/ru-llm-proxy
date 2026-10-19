@@ -101,6 +101,6 @@ def test_tiny2_manifest_pins_the_released_weights():
 
     assert (
         weights["model.safetensors"].sha256
-        == "53cde9f0e47f95478411457e1d74fdc16070517d54a2b45a27d74e49ea75cb67"
+        == "dcbacfba6daeb68cf87bfcf229fbb29f9639b8cc81383e631262247d07bd1d7d"
     )
     assert manifest.base_model == "cointegrated/rubert-tiny2"

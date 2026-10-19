@@ -58,13 +58,14 @@ PROFILES: dict[str, NERModelProfile] = {
         o_logit_bias=0.0,
         span_postprocessing=SPAN_POSTPROCESSING_NONE,
     ),
-    # rubert-tiny2 trained on data rebuilt with Nikita's dataset pipeline. The
-    # O-logit bias and span post-processing were selected on validation data
-    # together with these weights; see docs/research/ner-tiny2.md.
+    # rubert-tiny2 trained on data rebuilt with Nikita's dataset pipeline, then
+    # fine-tuned to work without spaCy NER (+2 to PERSON/LOCATION/ORGANIZATION
+    # B-/I- classifier bias). The O-logit bias and span post-processing were
+    # selected on validation data; see docs/research/ner-tiny2.md.
     "tiny2": NERModelProfile(
         name="tiny2",
         model_id="local/rubert-tiny2-secret-detection",
-        revision="nikita-style-tiny2-2026-09-28-mix-a-s1",
+        revision="tiny2-mix-a-s1-ft-spacy-free-20261013-a-e2-b2",
         manifest_filename="model_manifest.tiny2.json",
         directory=Path("/opt/models/rubert-tiny2-secret-detection"),
         o_logit_bias=1.0,
