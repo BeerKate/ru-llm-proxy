@@ -122,3 +122,19 @@ def test_lemma_only_pipes_exist_in_the_spacy_model_and_keep_lemmas():
     doc = nlp("Паспорт выдан отделением в Твери")
     assert [token.lemma_ for token in doc][0] == "паспорт"
     assert not doc.ents
+
+
+def test_tiny2_sentencizer_restores_sentence_starts_without_the_parser():
+    import spacy
+
+    from model_profiles import SPACY_LEMMA_ONLY_DISABLED
+
+    assert resolve_profile({"PRESIDIO_ANALYZER_NER_MODEL_PROFILE": "tiny2"}).spacy_sentencizer
+    assert not resolve_profile({}).spacy_sentencizer
+    nlp = spacy.load("ru_core_news_sm")
+    for pipe in SPACY_LEMMA_ONLY_DISABLED:
+        nlp.disable_pipe(pipe)
+    nlp.add_pipe("sentencizer", first=True)
+    text = "Компания ООО Вектор. Верни ровно MODEL_OK."
+    starts = [token.idx for token in nlp(text) if token.is_sent_start]
+    assert text.index("Верни") in starts

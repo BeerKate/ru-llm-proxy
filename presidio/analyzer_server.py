@@ -461,6 +461,8 @@ for spacy_pipe in ACTIVE_PROFILE.spacy_disabled_pipes:
     if spacy_pipe not in nlp_engine.nlp["ru"].pipe_names:
         raise RuntimeError(f"spaCy component {spacy_pipe!r} is not in the ru model")
     nlp_engine.nlp["ru"].disable_pipe(spacy_pipe)
+if ACTIVE_PROFILE.spacy_sentencizer:
+    nlp_engine.nlp["ru"].add_pipe("sentencizer", first=True)
 analyzer = AnalyzerEngine(nlp_engine=nlp_engine)
 
 # The specialized BERT owns these types: generic spaCy predictions otherwise

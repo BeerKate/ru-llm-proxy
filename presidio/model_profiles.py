@@ -52,6 +52,9 @@ class NERModelProfile:
     # Drop model names that end or start inside a Latin word (Don|e); see
     # result_merging.NER_NAME_WORD_PIECES_KEY.
     drop_name_word_pieces: bool = False
+    # Rule-based sentence starts for a pipeline without the spaCy parser; the
+    # name refinement needs them to cut instruction tails (ООО Вектор. Верни).
+    spacy_sentencizer: bool = False
 
 
 PROFILES: dict[str, NERModelProfile] = {
@@ -79,6 +82,7 @@ PROFILES: dict[str, NERModelProfile] = {
         span_postprocessing=SPAN_POSTPROCESSING_SECRETS_CONTRACTS,
         spacy_disabled_pipes=SPACY_LEMMA_ONLY_DISABLED,
         drop_name_word_pieces=True,
+        spacy_sentencizer=True,
     ),
 }
 DEFAULT_PROFILE = "bert"
