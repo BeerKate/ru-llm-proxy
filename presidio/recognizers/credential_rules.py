@@ -226,7 +226,10 @@ class _CapturedCredentialRecognizer(EntityRecognizer):
                 start, end, value = _strip_value_wrapper(text, start, end)
                 if not quoted and value in defined_symbols:
                     continue
-                if start >= end or not self._accept_value(value, rule.rule_id):
+                if start >= end or not self._accept_match(
+                    value, rule.rule_id, match.group("value"),
+                    text[match.end("value"):match.end("value") + 64]
+                ):
                     continue
                 results.append(
                     RecognizerResult(
@@ -241,6 +244,9 @@ class _CapturedCredentialRecognizer(EntityRecognizer):
 
     def _accept_value(self, value: str, rule_id: str) -> bool:
         return not _is_inert_credential_value(value)
+
+    def _accept_match(self, value: str, rule_id: str, raw_value: str, tail: str) -> bool:
+        return self._accept_value(value, rule_id)
 
 
 _ENV_PREFIX = r"(?:[A-Za-z][A-Za-z0-9]{0,31}[._]){0,3}"
@@ -396,6 +402,27 @@ class PasswordRecognizer(_CapturedCredentialRecognizer):
             name=name,
             supported_language=supported_language,
         )
+
+    def _accept_match(self, value: str, rule_id: str, raw_value: str, tail: str) -> bool:
+        # An explicit password assignment can contain only punctuation and be
+        # shorter than four characters. Keep code/template references inert;
+        # this exception does not apply to logins, tokens or unlabelled text.
+        if value.strip() and not any(character.isalnum() for character in value):
+            quoted = len(raw_value) >= 2 and _QUOTE_PAIRS.get(raw_value[0]) == raw_value[-1]
+            if quoted:
+                if re.fullmatch(r"(?:\{[^{}\r\n]*\})+", value) and re.match(
+                    r"\s*\.format\s*\(", tail
+                ):
+                    return False
+            elif re.fullmatch(r"[!$@#%^*+_~\\-]{1,256}", value) is None:
+                # Reject partial operators, containers and quotation syntax.
+                return False
+            return (
+                len(value) <= 256
+                and _PLACEHOLDER_RE.fullmatch(value.strip()) is None
+                and not value.strip().startswith(("$(", "`"))
+            )
+        return self._accept_value(value, rule_id)
 
     def _accept_value(self, value: str, rule_id: str) -> bool:
         return not _is_inert_credential_value(value) and len(value) >= 4
