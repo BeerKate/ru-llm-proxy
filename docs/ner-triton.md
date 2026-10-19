@@ -19,7 +19,7 @@ docker compose -f docker-compose.yml -f docker-compose.triton.yml up -d ner-trit
 `triton`, CPU FP32 и пакет8 окон. ONNX экспортируется во время сборки из
 проверенных локальных весов. Интернет во время работы модели не требуется.
 Порты Triton не публикуются на хост; Analyzer обращается по внутренней сети.
-GPU не требуется. По умолчанию один инстанс Triton и один процесс Analyzer.
+GPU не требуется. По умолчанию три инстанса Triton и два процесса Analyzer.
 
 ```bash
 curl --fail http://localhost:5001/api/v1/health
@@ -29,8 +29,11 @@ curl --fail http://localhost:5001/api/v1/analyze \
 ```
 
 Текст в примере фиктивный. В runtime и стартовом журнале backend — `triton`.
-Ограничения параллельности/очереди Analyzer остаются исходными. Настройки
-нагрузочного стенда 128/600 и admission8/32 сюда не перенесены.
+Профиль задаёт свою очередь Analyzer, проверенную на одной реплике в 4 CPU:
+2 процесса × 4 анализа, очередь 64, ожидание до 30 с (`TINY2_*` в
+[справочнике](configuration.md#дополнительный-backend-ner)). Обычный способ запуска —
+`make up ANALYZER_PROFILE=tiny2`, в том числе с `TOPOLOGY=production`
+([развёртывание](deployment.md#tiny2)); команды выше — для ручной проверки.
 
 ## Контракт
 

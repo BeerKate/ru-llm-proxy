@@ -3,8 +3,8 @@
 ## Дополнительный backend NER
 
 Обычный запуск использует Transformers/PyTorch. CPU Tiny2 через Triton/ONNX
-включается отдельным compose-файлом; запуск и откат — в
-[руководстве Triton](ner-triton.md).
+включается профилем `ANALYZER_PROFILE=tiny2` (он подключает
+`docker-compose.triton.yml`); запуск и откат — в [руководстве Triton](ner-triton.md).
 
 | Переменная | Default | Назначение |
 |---|---|---|
@@ -13,7 +13,18 @@
 | `PRESIDIO_ANALYZER_TRITON_MODEL_NAME` | `tiny2` | Имя проверенной модели |
 | `PRESIDIO_ANALYZER_TRITON_MODEL_VERSION` | `1` | Явная версия модели |
 | `PRESIDIO_ANALYZER_TRITON_TIMEOUT_SECONDS` | `60` | Таймаут одного вызова |
-| `TRITON_MODEL_INSTANCES` | `1` | Инстансы CPU модели в дополнительном образе |
+| `TRITON_MODEL_INSTANCES` | `3` (production Tiny2 — `5`) | Параллельные CPU-исполнения модели в Triton |
+| `TINY2_ANALYZER_WORKERS` | `2` | Процессы Analyzer в контейнере профиля `tiny2` |
+| `TINY2_ANALYZER_CONCURRENCY_LIMIT` | `4` | Одновременные анализы в каждом процессе профиля `tiny2` |
+| `TINY2_ANALYZER_QUEUE_LIMIT` | `64` | Очередь каждого процесса профиля `tiny2` |
+| `TINY2_ANALYZER_QUEUE_TIMEOUT_SECONDS` | `30` | Ожидание места в очереди до `503 analyzer_overloaded` для профиля `tiny2` |
+| `TINY2_NER_BOUNDARY_RECHECK` | `shell-prompt` | Перепроверка границы окна у `$` приглашения терминала для профиля `tiny2` |
+
+Профиль `tiny2` задаёт свои значения очереди вместо общих
+`PRESIDIO_ANALYZER_WORKERS`, `PRESIDIO_ANALYZER_CONCURRENCY_LIMIT`,
+`PRESIDIO_ANALYZER_QUEUE_LIMIT` и `PRESIDIO_ANALYZER_QUEUE_TIMEOUT_SECONDS`: с
+одним анализом и ожиданием 1 с маленькая модель тоже отвечает `503` уже при
+нескольких одновременных запросах.
 
 
 Этот документ является единым справочником по переменным окружения проекта. `.env.example` намеренно содержит только минимальные значения для быстрого запуска; остальные настройки задаются через `docker-compose.yml`, `litellm-config.yaml`, административный интерфейс LiteLLM, параметры Makefile или переменные окружения конкретных быстрых проверок.
@@ -81,6 +92,12 @@
 | `DB_CPUS`, `DB_MEMORY` | `2.0`, `4g` | CPU и память PostgreSQL LiteLLM |
 | `CODEX_LB_CPUS`, `CODEX_LB_MEMORY` | `2.0`, `4g` | CPU и память codex-lb, только расширенный состав |
 | `CODEX_LB_DB_CPUS`, `CODEX_LB_DB_MEMORY` | `1.0`, `2g` | CPU и память PostgreSQL codex-lb, только расширенный состав |
+| `TRITON_CPUS`, `TRITON_MEMORY` | `5.0`, `6g` | CPU и память общего Triton, только `ANALYZER_PROFILE=tiny2` |
+| `TRITON_MODEL_INSTANCES` | `5` | Положительное целое; параллельные исполнения модели в Triton, только `tiny2` |
+
+С `ANALYZER_PROFILE=tiny2` поверх пресета применяется
+[`production-tiny2.env`](../deploy/topologies/production-tiny2.env): 2 Analyzer по
+1,5 CPU / 4 GiB и один общий Triton на 5 CPU / 6 GiB, всего 8 CPU на NER.
 
 CPU — положительное число, допускается дробная часть. Память — положительный
 размер в байтах либо с суффиксом `k`, `m`, `g`, `t` (множитель 1024).

@@ -1,4 +1,7 @@
-# Opt-in CPU Tiny2/FP32 backend; combine with docker-compose.yml.
+# Opt-in CPU Tiny2/FP32 backend (ANALYZER_PROFILE=tiny2); combine with docker-compose.yml.
+# Admission defaults are the ones validated with Tiny2 on one 4-CPU replica:
+# two Analyzer processes with four analyses each, a bounded 30 s queue and
+# three Triton instances. TINY2_* variables override them for this profile only.
 services:
   ner-triton:
     image: ru-llm-proxy-ner-triton:tiny2-fp32
@@ -11,7 +14,7 @@ services:
         PIP_INDEX_URL: ${PIP_INDEX_URL:-}
         PYTORCH_INDEX_URL: ${PYTORCH_INDEX_URL:-https://download.pytorch.org/whl/cpu}
     environment:
-      TRITON_MODEL_INSTANCES: ${TRITON_MODEL_INSTANCES:-1}
+      TRITON_MODEL_INSTANCES: ${TRITON_MODEL_INSTANCES:-3}
     restart: unless-stopped
     healthcheck:
       test: [CMD, python3, -c, "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/v2/models/tiny2/versions/1/ready', timeout=3).read()"]
@@ -34,6 +37,11 @@ services:
       PRESIDIO_ANALYZER_TRITON_MODEL_VERSION: "1"
       PRESIDIO_ANALYZER_TRITON_TIMEOUT_SECONDS: ${PRESIDIO_ANALYZER_TRITON_TIMEOUT_SECONDS:-60}
       PRESIDIO_ANALYZER_NER_BATCH_SIZE: ${PRESIDIO_ANALYZER_NER_BATCH_SIZE:-8}
+      PRESIDIO_ANALYZER_NER_BOUNDARY_RECHECK: ${TINY2_NER_BOUNDARY_RECHECK:-shell-prompt}
+      PRESIDIO_ANALYZER_WORKERS: ${TINY2_ANALYZER_WORKERS:-2}
+      PRESIDIO_ANALYZER_CONCURRENCY_LIMIT: ${TINY2_ANALYZER_CONCURRENCY_LIMIT:-4}
+      PRESIDIO_ANALYZER_QUEUE_LIMIT: ${TINY2_ANALYZER_QUEUE_LIMIT:-64}
+      PRESIDIO_ANALYZER_QUEUE_TIMEOUT_SECONDS: ${TINY2_ANALYZER_QUEUE_TIMEOUT_SECONDS:-30}
       PRESIDIO_ANALYZER_DEVICE_PROFILE: cpu
       PRESIDIO_ANALYZER_GPU_PRECISION: fp32
       OMP_NUM_THREADS: "1"
