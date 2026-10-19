@@ -101,6 +101,10 @@ _DATE_LIKE_RE = re.compile(r"\d{1,2}[./-]\d{1,2}[./-]\d{2,4}")
 _DOTTED_VERSION_RE = re.compile(r"\d{1,3}(?:\.\d{1,3}){1,3}")
 _SENTENCE_BOUNDARIES = frozenset(".!?;。！？")
 _NAME_TYPES = frozenset({"PERSON", "ORGANIZATION"})
+_JOINED_NAME_TYPES = frozenset({"PERSON", "LOCATION", "ORGANIZATION"})
+_NAME_JOIN_GAP_RE = re.compile(r"[\s«»\"'„“”‘’\-–—]{1,3}")
+_NAME_QUOTE_PAIRS = (("«", "»"), ("„", "“"), ("“", "”"))
+_ESCAPE_LETTERS = frozenset('ntrbfu"/\\')
 _IDENTIFIER_CHARACTERS = frozenset(
     "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_"
 )
@@ -337,6 +341,12 @@ def merge_results(
                 MergeDecision("invalid_span", SOURCE_NONE, source)
             )
             continue
+        if result.entity_type in _JOINED_NAME_TYPES:
+            trimmed = _skip_escape_letter(text, result)
+            if trimmed is None:
+                decisions.append(MergeDecision("name_escape_letter_dropped", SOURCE_NONE, source))
+                continue
+            result = trimmed
         if (
             source == SOURCE_NER
             and result.entity_type == "LOGIN"
@@ -505,9 +515,84 @@ def merge_results(
         decisions.append(
             MergeDecision("overlap_fragment_kept", detection_source(fragment), SOURCE_NONE)
         )
+    kept, joined = _join_name_fragments(text, kept)
+    decisions.extend(
+        MergeDecision("name_fragments_joined", detection_source(r), detection_source(r))
+        for r in joined
+    )
 
     kept.sort(key=lambda result: (result.start, result.end, result.entity_type))
     return MergeOutcome(tuple(kept), tuple(decisions))
+
+
+def _skip_escape_letter(text: str, result: RecognizerResult) -> RecognizerResult | None:
+    """Move a name start off the letter of a backslash escape such as ``\\nСервис``.
+
+    Masking ``nСервис`` would leave a lone backslash and break the JSON or
+    code string; a name that was only that letter is dropped.
+    """
+    start = result.start
+    if start > 0 and text[start - 1] == "\\" and text[start] in _ESCAPE_LETTERS:
+        start += 1
+        if not any(character.isalnum() for character in text[start : result.end]):
+            return None
+        return _copy_name(result, start=start)
+    return result
+
+
+def _join_name_fragments(
+    text: str,
+    kept: list[RecognizerResult],
+) -> tuple[list[RecognizerResult], list[RecognizerResult]]:
+    """Join same-type model names split by spaces, quotes or dashes; close edge quotes.
+
+    ``ООО`` + ``«Лаборатория Север»`` or ``Москва - Гавана`` are one value; a
+    gap of punctuation between two masks would otherwise stay visible. A
+    model name that leaves a quote pair half-open takes the neighbouring quote
+    when no other result owns it. Deterministic results keep their boundaries.
+    """
+    ordered = sorted(kept, key=lambda r: (r.start, r.end))
+    joined: list[RecognizerResult] = []
+    out: list[RecognizerResult] = []
+    for result in ordered:
+        last = out[-1] if out else None
+        if (
+            last is not None
+            and result.entity_type == last.entity_type
+            and result.entity_type in _JOINED_NAME_TYPES
+            and _is_statistical(last)
+            and _is_statistical(result)
+            and last.end <= result.start
+            and _NAME_JOIN_GAP_RE.fullmatch(text[last.end : result.start])
+        ):
+            out[-1] = _copy_name(last, end=result.end, score=max(last.score, result.score))
+            joined.append(out[-1])
+        else:
+            out.append(result)
+    for index, result in enumerate(out):
+        if result.entity_type not in _JOINED_NAME_TYPES or not _is_statistical(result):
+            continue
+        start, end = _balance_name_quotes(text, result.start, result.end)
+        previous_end = out[index - 1].end if index > 0 else 0
+        next_start = out[index + 1].start if index + 1 < len(out) else len(text)
+        if (start, end) != (result.start, result.end) and start >= previous_end and end <= next_start:
+            out[index] = _copy_name(result, start=start, end=end)
+    return out, joined
+
+
+def _balance_name_quotes(text: str, start: int, end: int) -> tuple[int, int]:
+    value = text[start:end]
+    for opening, closing in _NAME_QUOTE_PAIRS:
+        if value.count(opening) > value.count(closing) and end < len(text) and text[end] == closing:
+            end += 1
+        elif value.count(closing) > value.count(opening) and start > 0 and text[start - 1] == opening:
+            start -= 1
+    if value.count('"') % 2 == 1:
+        if end < len(text) and text[end] == '"':
+            end += 1
+        elif start > 0 and text[start - 1] == '"':
+            start -= 1
+    return start, end
 
 
 def _cuts_code_identifier(text: str, start: int, end: int) -> bool:
@@ -544,25 +629,30 @@ def _is_statistical(result: RecognizerResult) -> bool:
     )
 
 
-def _keeps_uncovered_fragments(
+def _fragment_mode(
     result: RecognizerResult,
     kept: list[RecognizerResult],
-) -> bool:
-    """Whether an overlapped result may keep the characters no winner covers.
+) -> str | None:
+    """Which characters of an overlapped result no winner covers may stay masked.
 
     Additive address/passport rules complete what other detections leave
-    open. A model span keeps its remainder only when every overlapping winner
-    is statistical too; a deterministic winner defines the value boundaries.
+    open. A model span keeps its whole remainder when every overlapping winner
+    is statistical too. Against a deterministic winner, which defines the value
+    boundaries, it keeps only a token glued to the right of a winner: a value
+    cut short at ``&`` continues there, while labels such as ``token=``,
+    ``Bearer`` or ``no.`` precede the value and stay visible.
     """
     if _recognizer_name(result) in _ADDITIVE_RECOGNIZERS:
-        return True
+        return "remainder"
     if detection_source(result) != SOURCE_NER:
-        return False
-    return all(
+        return None
+    if all(
         _is_statistical(winner)
         for winner in kept
         if _spans_overlap(result.start, result.end, winner.start, winner.end)
-    )
+    ):
+        return "remainder"
+    return "glued_right"
 
 
 def _uncovered_fragments(
@@ -577,12 +667,14 @@ def _uncovered_fragments(
     Every overlapped result already passed the source filters above; each
     uncovered run keeps its type, score and metadata, trimmed of edge spaces.
     """
-    overlapped = [r for r in overlapped if _keeps_uncovered_fragments(r, kept)]
+    modes = {id(r): _fragment_mode(r, kept) for r in overlapped}
+    overlapped = [r for r in overlapped if modes[id(r)] is not None]
     if not overlapped:
         return []
     covered = bytearray(len(text))
     for result in kept:
         covered[result.start : result.end] = b"\x01" * (result.end - result.start)
+    winner_ends = {result.end for result in kept}
     fragments = []
     for result in sorted(overlapped, key=lambda r: (r.start, r.start - r.end)):
         index = result.start
@@ -594,6 +686,13 @@ def _uncovered_fragments(
             while run_end < result.end and not covered[run_end]:
                 run_end += 1
             start, end = index, run_end
+            if modes[id(result)] == "glued_right":
+                if start not in winner_ends or text[start].isspace():
+                    index = run_end
+                    continue
+                end = start
+                while end < run_end and not text[end].isspace():
+                    end += 1
             while start < end and text[start].isspace():
                 start += 1
             while end > start and text[end - 1].isspace():

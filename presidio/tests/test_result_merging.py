@@ -453,15 +453,17 @@ def test_model_value_keeps_the_part_a_spacy_location_does_not_cover():
 
     outcome = merge_results(text, [spacy_city, ner_location])
 
+    # "г." and spaCy's "Тверь" are then joined across the space; every
+    # character of the model value stays covered.
     assert _summary(outcome) == [
-        ("LOCATION", text.index("г."), text.index("г.") + 2, 0.9),
-        ("LOCATION", text.index("Тверь"), text.index(","), 0.85),
+        ("LOCATION", text.index("г."), text.index(","), 0.9),
         ("LOCATION", text.index(","), len(text), 0.9),
     ]
     assert [decision.reason for decision in outcome.decisions] == [
         "overlap_preferred_source",
         "overlap_fragment_kept",
         "overlap_fragment_kept",
+        "name_fragments_joined",
     ]
 
 
@@ -532,4 +534,71 @@ def test_whole_words_cyrillic_and_other_types_are_not_identifier_fragments(text,
 
     assert _summary(merge_results(text, [ner])) == [
         (entity_type, start, start + len(value), 0.9)
+    ]
+
+
+def test_model_password_keeps_the_tail_a_native_value_cut_at_an_ampersand():
+    text = "REDIS_PASS=i$N+=S&84dOvw^euNCcwvq9r"
+    start = text.index("i$N")
+    native = _result("PASSWORD", start, text.index("&"), 0.9, SOURCE_NATIVE_CREDENTIAL)
+    ner = _result("PASSWORD", start, len(text), 0.95, SOURCE_NER)
+
+    assert _summary(merge_results(text, [native, ner])) == [
+        ("PASSWORD", start, text.index("&"), 0.9),
+        ("PASSWORD", text.index("&"), len(text), 0.95),
+    ]
+
+
+def test_glued_tail_stops_at_whitespace_and_never_takes_a_left_label():
+    text = "token=SyntheticToken42&x2 for deploy"
+    value = "SyntheticToken42"
+    start = text.index(value)
+    native = _result("AUTH_TOKEN", start, start + len(value), 0.7, SOURCE_NATIVE_CREDENTIAL)
+    wider_ner = _result("AUTH_TOKEN", 0, len(text), 0.99, SOURCE_NER)
+
+    assert _summary(merge_results(text, [wider_ner, native])) == [
+        ("AUTH_TOKEN", start, start + len(value), 0.7),
+        ("AUTH_TOKEN", start + len(value), text.index(" for"), 0.99),
+    ]
+
+
+@pytest.mark.parametrize(
+    ("text", "pieces", "value"),
+    [
+        ("Москва - Гавана - Каракас", ("Москва", "Гавана - Каракас"), "Москва - Гавана - Каракас"),
+        ("Rambler - Новости", ("Rambler", "Новости"), "Rambler - Новости"),
+        ("ООО «Лаборатория Север» сообщило", ("ООО", "«Лаборатория Север"), "ООО «Лаборатория Север»"),
+    ],
+)
+def test_same_type_name_fragments_are_joined(text, pieces, value):
+    results = [
+        _result("LOCATION" if "Москва" in text else "ORGANIZATION",
+                text.index(piece), text.index(piece) + len(piece), 0.9, SOURCE_NER)
+        for piece in pieces
+    ]
+
+    outcome = merge_results(text, results)
+
+    assert [(r.start, r.end) for r in outcome.results] == [
+        (text.index(value), text.index(value) + len(value))
+    ]
+
+
+def test_names_of_different_types_or_far_apart_are_not_joined():
+    text = "Иван, Москва и Тверь"
+    person = _result("PERSON", 0, 4, 0.9, SOURCE_NER)
+    city = _result("LOCATION", 6, 12, 0.9, SOURCE_NER)
+    other = _result("LOCATION", text.index("Тверь"), len(text), 0.9, SOURCE_NER)
+
+    assert len(merge_results(text, [person, city, other]).results) == 3
+
+
+def test_name_start_moves_off_a_backslash_escape_letter():
+    text = '{"text": "Привет\\nСервис Плюс"}'
+    start = text.index("nСервис")
+    ner = _result("ORGANIZATION", start, text.index('"}'), 0.9, SOURCE_NER)
+    escape_only = _result("PERSON", start, start + 1, 0.9, SOURCE_NER)
+
+    assert _summary(merge_results(text, [ner, escape_only])) == [
+        ("ORGANIZATION", start + 1, text.index('"}'), 0.9)
     ]
