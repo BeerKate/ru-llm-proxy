@@ -101,6 +101,10 @@ _DATE_LIKE_RE = re.compile(r"\d{1,2}[./-]\d{1,2}[./-]\d{2,4}")
 _DOTTED_VERSION_RE = re.compile(r"\d{1,3}(?:\.\d{1,3}){1,3}")
 _SENTENCE_BOUNDARIES = frozenset(".!?;。！？")
 _NAME_TYPES = frozenset({"PERSON", "ORGANIZATION"})
+# Generic model predictions that never correct another detection's boundaries.
+_STATISTICAL_RECOGNIZERS = frozenset({"SpacyRecognizer"})
+# Rules that only add coverage; their open parts survive any overlap.
+_ADDITIVE_RECOGNIZERS = frozenset({"RuAddressChainRecognizer", "RuPassportExtRecognizer"})
 _LEGAL_FORM_RE = re.compile(r"(?:ООО|АО|ПАО|ОАО|ЗАО)", re.IGNORECASE)
 _NAME_WORDS_RE = re.compile(r"[А-Яа-яЁё]+(?:[- \t\u00a0][А-Яа-яЁё]+){1,2}")
 _PERSON_FIELD_RE = re.compile(r"(?i)(?<!\w)(?:фио|ф\.и\.о\.)\s*[:=]\s*$")
@@ -454,6 +458,7 @@ def merge_results(
     valid_results = retained
     ordered = sorted(valid_results, key=_priority_key)
     kept: list[RecognizerResult] = []
+    overlapped: list[RecognizerResult] = []
     for candidate in ordered:
         conflict = next(
             (
@@ -479,9 +484,88 @@ def merge_results(
                 detection_source(candidate),
             )
         )
+        overlapped.append(candidate)
+
+    for fragment in _uncovered_fragments(text, kept, overlapped):
+        kept.append(fragment)
+        decisions.append(
+            MergeDecision("overlap_fragment_kept", detection_source(fragment), SOURCE_NONE)
+        )
 
     kept.sort(key=lambda result: (result.start, result.end, result.entity_type))
     return MergeOutcome(tuple(kept), tuple(decisions))
+
+
+def _recognizer_name(result: RecognizerResult) -> str:
+    return str((result.recognition_metadata or {}).get(RecognizerResult.RECOGNIZER_NAME_KEY, ""))
+
+
+def _is_statistical(result: RecognizerResult) -> bool:
+    return (
+        detection_source(result) == SOURCE_NER
+        or _recognizer_name(result) in _STATISTICAL_RECOGNIZERS
+    )
+
+
+def _keeps_uncovered_fragments(
+    result: RecognizerResult,
+    kept: list[RecognizerResult],
+) -> bool:
+    """Whether an overlapped result may keep the characters no winner covers.
+
+    Additive address/passport rules complete what other detections leave
+    open. A model span keeps its remainder only when every overlapping winner
+    is statistical too; a deterministic winner defines the value boundaries.
+    """
+    if _recognizer_name(result) in _ADDITIVE_RECOGNIZERS:
+        return True
+    if detection_source(result) != SOURCE_NER:
+        return False
+    return all(
+        _is_statistical(winner)
+        for winner in kept
+        if _spans_overlap(result.start, result.end, winner.start, winner.end)
+    )
+
+
+def _uncovered_fragments(
+    text: str,
+    kept: list[RecognizerResult],
+    overlapped: list[RecognizerResult],
+) -> list[RecognizerResult]:
+    """Return the eligible parts of overlapped results that no winner covers.
+
+    Overlap resolution drops a whole lower-priority result even when it is
+    longer than the winner, so its other characters would reach the provider.
+    Every overlapped result already passed the source filters above; each
+    uncovered run keeps its type, score and metadata, trimmed of edge spaces.
+    """
+    overlapped = [r for r in overlapped if _keeps_uncovered_fragments(r, kept)]
+    if not overlapped:
+        return []
+    covered = bytearray(len(text))
+    for result in kept:
+        covered[result.start : result.end] = b"\x01" * (result.end - result.start)
+    fragments = []
+    for result in sorted(overlapped, key=lambda r: (r.start, r.start - r.end)):
+        index = result.start
+        while index < result.end:
+            if covered[index]:
+                index += 1
+                continue
+            run_end = index
+            while run_end < result.end and not covered[run_end]:
+                run_end += 1
+            start, end = index, run_end
+            while start < end and text[start].isspace():
+                start += 1
+            while end > start and text[end - 1].isspace():
+                end -= 1
+            if start < end:
+                fragments.append(_copy_name(result, start=start, end=end))
+                covered[index:run_end] = b"\x01" * (run_end - index)
+            index = run_end
+    return fragments
 
 
 def _copy_name(

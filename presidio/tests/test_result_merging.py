@@ -156,8 +156,11 @@ def test_ner_conflict_uses_score_then_stable_boundaries():
     low = _result("ORGANIZATION", 0, len(text), 0.6, SOURCE_NER)
     high = _result("PERSON", 0, 4, 0.9, SOURCE_NER)
 
-    assert [result.entity_type for result in merge_results(text, [low, high]).results] == [
-        "PERSON"
+    # The higher score owns the overlap; the rest of the lower-score model
+    # value stays masked instead of reaching the provider.
+    assert _summary(merge_results(text, [low, high])) == [
+        ("PERSON", 0, 4, 0.9),
+        ("ORGANIZATION", 5, len(text), 0.6),
     ]
 
     left = _result("PERSON", 0, 4, 0.9, SOURCE_NER)
@@ -172,10 +175,10 @@ def test_ner_score_precedes_entity_specificity():
     low_token = _result("AUTH_TOKEN", 0, len(text), 0.4, SOURCE_NER)
     high_person = _result("PERSON", 0, 4, 0.95, SOURCE_NER)
 
-    assert [
-        result.entity_type
-        for result in merge_results(text, [low_token, high_person]).results
-    ] == ["PERSON"]
+    assert _summary(merge_results(text, [low_token, high_person])) == [
+        ("PERSON", 0, 4, 0.95),
+        ("AUTH_TOKEN", 5, len(text), 0.4),
+    ]
 
 
 def test_merge_is_stable_for_every_input_permutation():
@@ -436,3 +439,58 @@ def test_contract_context_fallback_respects_score_threshold():
 
     assert outcome.results == ()
     assert outcome.decisions == ()
+
+
+def test_model_value_keeps_the_part_a_spacy_location_does_not_cover():
+    text = "Офис: г. Тверь, ул. Советская"
+    spacy_city = _result(
+        "LOCATION", text.index("Тверь"), text.index(","), 0.85,
+        recognizer_name="SpacyRecognizer",
+    )
+    ner_location = _result(
+        "LOCATION", text.index("г."), len(text), 0.9, SOURCE_NER
+    )
+
+    outcome = merge_results(text, [spacy_city, ner_location])
+
+    assert _summary(outcome) == [
+        ("LOCATION", text.index("г."), text.index("г.") + 2, 0.9),
+        ("LOCATION", text.index("Тверь"), text.index(","), 0.85),
+        ("LOCATION", text.index(","), len(text), 0.9),
+    ]
+    assert [decision.reason for decision in outcome.decisions] == [
+        "overlap_preferred_source",
+        "overlap_fragment_kept",
+        "overlap_fragment_kept",
+    ]
+
+
+def test_deterministic_winner_keeps_its_boundaries_against_a_model_value():
+    text = "token=SyntheticToken42 for deploy"
+    value = "SyntheticToken42"
+    native = _result(
+        "AUTH_TOKEN", text.index(value), text.index(value) + len(value), 0.7,
+        SOURCE_NATIVE_CREDENTIAL,
+    )
+    wider_ner = _result("AUTH_TOKEN", 0, len(text), 0.99, SOURCE_NER)
+
+    assert _summary(merge_results(text, [wider_ner, native])) == [
+        ("AUTH_TOKEN", text.index(value), text.index(value) + len(value), 0.7)
+    ]
+
+
+def test_additive_address_rule_completes_a_partial_native_address():
+    text = "Доставка: ул. Ленина, д. 10, кв. 5"
+    native = _result(
+        "RU_ADDRESS", text.index("ул."), text.index(", кв."), 0.85,
+        recognizer_name="RuAddressRecognizer",
+    )
+    chain = _result(
+        "RU_ADDRESS", text.index("ул."), len(text), 0.75,
+        recognizer_name="RuAddressChainRecognizer",
+    )
+
+    assert _summary(merge_results(text, [native, chain])) == [
+        ("RU_ADDRESS", text.index("ул."), text.index(", кв."), 0.85),
+        ("RU_ADDRESS", text.index(", кв."), len(text), 0.75),
+    ]
