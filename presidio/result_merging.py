@@ -105,6 +105,13 @@ _JOINED_NAME_TYPES = frozenset({"PERSON", "LOCATION", "ORGANIZATION"})
 _NAME_JOIN_GAP_RE = re.compile(r"[\s«»\"'„“”‘’\-–—]{1,3}")
 _NAME_QUOTE_PAIRS = (("«", "»"), ("„", "“"), ("“", "”"))
 _ESCAPE_LETTERS = frozenset('ntrbfu"/\\')
+_ORG_GENERIC_LEAD_RE = re.compile(r"(?i)(?:организация|компания)[ \t\u00a0]+(?=[^\W\d_])")
+# Only a separator glued to the last word; "Yahoo!" and a tokenized "вести ." keep theirs.
+_ORG_TRAILING_PUNCTUATION = frozenset(".;,:")
+# A span that ends with an initial such as "И." keeps its period.
+_TRAILING_INITIAL_RE = re.compile(r"(?:^|(?<=[\s.]))[А-ЯЁA-Z]\.$")
+# One or two Cyrillic initials right after a surname: Петров И. С.
+_TRAILING_INITIALS_RE = re.compile(r"[ \t\u00a0]+[А-ЯЁ]\.(?:[ \t\u00a0]?[А-ЯЁ]\.)?(?![А-Яа-яЁё])")
 _IDENTIFIER_CHARACTERS = frozenset(
     "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_"
 )
@@ -347,6 +354,14 @@ def merge_results(
                 decisions.append(MergeDecision("name_escape_letter_dropped", SOURCE_NONE, source))
                 continue
             result = trimmed
+        if result.entity_type == "ORGANIZATION" and source == SOURCE_NER:
+            trimmed = _trim_model_organization(text, result)
+            if trimmed is None:
+                decisions.append(MergeDecision("organization_boundary_empty", SOURCE_NONE, source))
+                continue
+            if trimmed is not result:
+                decisions.append(MergeDecision("organization_boundary_trimmed", source, source))
+            result = trimmed
         if (
             source == SOURCE_NER
             and result.entity_type == "LOGIN"
@@ -530,6 +545,33 @@ def merge_results(
     return MergeOutcome(tuple(kept), tuple(decisions))
 
 
+def _trim_model_organization(text: str, result: RecognizerResult) -> RecognizerResult | None:
+    """Drop a glued closing separator and a leading generic noun from a model organization.
+
+    ``ООО Вектор.`` and ``Организация Northwind Research Ltd`` name the same
+    companies as ``ООО Вектор`` and ``Northwind Research Ltd``. Only ``. ; , :``
+    glued to the last word are dropped, and a trailing initial such as ``И.``
+    keeps its period. Instruction tails after a sentence are handled by the
+    name refinement below.
+    """
+    start, end = result.start, result.end
+    lead = _ORG_GENERIC_LEAD_RE.match(text, start, end)
+    if lead is not None:
+        start = lead.end()
+    while (
+        end - start > 1
+        and text[end - 1] in _ORG_TRAILING_PUNCTUATION
+        and not text[end - 2].isspace()
+        and _TRAILING_INITIAL_RE.search(text, start, end) is None
+    ):
+        end -= 1
+    if (start, end) == (result.start, result.end):
+        return result
+    if not any(character.isalnum() for character in text[start:end]):
+        return None
+    return _copy_name(result, start=start, end=end)
+
+
 def _skip_escape_letter(text: str, result: RecognizerResult) -> RecognizerResult | None:
     """Move a name start off the letter of a backslash escape such as ``\\nСервис``.
 
@@ -553,8 +595,10 @@ def _join_name_fragments(
 
     ``ООО`` + ``«Лаборатория Север»`` or ``Москва - Гавана`` are one value; a
     gap of punctuation between two masks would otherwise stay visible. A
-    model name that leaves a quote pair half-open takes the neighbouring quote
-    when no other result owns it. Deterministic results keep their boundaries.
+    model name that leaves a quote pair half-open takes the neighbouring quote,
+    and a model surname takes the initials right after it (``Петров И. С.``),
+    when no other result owns those characters. Deterministic results keep
+    their boundaries.
     """
     ordered = sorted(kept, key=lambda r: (r.start, r.end))
     joined: list[RecognizerResult] = []
@@ -578,6 +622,10 @@ def _join_name_fragments(
         if result.entity_type not in _JOINED_NAME_TYPES or not _is_statistical(result):
             continue
         start, end = _balance_name_quotes(text, result.start, result.end)
+        if result.entity_type == "PERSON":
+            initials = _TRAILING_INITIALS_RE.match(text, end)
+            if initials is not None:
+                end = initials.end()
         previous_end = out[index - 1].end if index > 0 else 0
         next_start = out[index + 1].start if index + 1 < len(out) else len(text)
         if (start, end) != (result.start, result.end) and start >= previous_end and end <= next_start:
@@ -817,7 +865,11 @@ def _refine_names(
                     before = text[result.start : boundary].rstrip()
                     if not before.endswith("."):
                         continue
-                    tail = text[boundary : result.end].strip()
+                    # A subword model may stop inside the word (Верн|и).
+                    tail_end = result.end
+                    while tail_end < len(text) and text[tail_end].isalpha():
+                        tail_end += 1
+                    tail = text[boundary:tail_end].strip()
                     if not _is_unambiguous_imperative(tail):
                         continue
                     end = result.start + len(before) - 1
@@ -890,18 +942,15 @@ def _refine_explicit_name_values(
     ):
         return results, decisions
     # Only a separate field header may be discarded, never its value or a
-    # similarly named organization in prose. BIO may include the separator.
-    label_spans = {
-        match.start("label"): (match.end("label"), match.end())
-        for match in _PERSON_LABEL_RE.finditer(text)
-    }
+    # similarly named organization in prose. BIO may include the separator,
+    # and a subword model may mark only pieces of the label (Ф. or .).
+    headers = [(match.start("label"), match.end()) for match in _PERSON_LABEL_RE.finditer(text)]
     retained = []
     for result in results:
         if (
             detection_source(result) == SOURCE_NER
             and result.entity_type in _NAME_TYPES
-            and (bounds := label_spans.get(result.start)) is not None
-            and bounds[0] <= result.end <= bounds[1]
+            and any(start <= result.start and result.end <= end for start, end in headers)
         ):
             decisions.append(MergeDecision("name_field_label", SOURCE_NONE, SOURCE_NER))
         else:

@@ -619,3 +619,94 @@ def test_organization_piece_of_a_split_secret_stays_masked():
     for result in outcome.results:
         covered.update(range(result.start, result.end))
     assert set(range(start, len(text))) <= covered
+
+
+@pytest.mark.parametrize(
+    ("text", "value"),
+    [
+        ("Документ подписал Петров И. С. вчера.", "Петров И. С."),
+        ("Документ подписал Петров И.С. вчера.", "Петров И.С."),
+        ('1. Лутц М., "Изучаем Python"', "Лутц М."),
+    ],
+)
+def test_model_surname_takes_the_initials_right_after_it(text, value):
+    start = text.index(value)
+    surname = _result("PERSON", start, start + value.index(" "), 0.99, SOURCE_NER)
+
+    assert _summary(merge_results(text, [surname])) == [
+        ("PERSON", start, start + len(value), 0.99)
+    ]
+
+
+def test_initials_are_not_taken_from_another_result_or_a_word():
+    text = "Петров И. Сидоров"
+    surname = _result("PERSON", 0, 6, 0.99, SOURCE_NER)
+    assert _summary(merge_results(text, [surname])) == [("PERSON", 0, 9, 0.99)]
+
+    text = "Петров Иван"
+    assert _summary(merge_results(text, [_result("PERSON", 0, 6, 0.99, SOURCE_NER)])) == [
+        ("PERSON", 0, 6, 0.99)
+    ]
+
+
+@pytest.mark.parametrize(
+    ("text", "pieces"),
+    [
+        ("Ф.И.О.:", [(0, 2)]),
+        ("Ф.И.О.: не заполнено.", [(0, 2)]),
+        ("ФИО: пока не указано.", [(0, 3)]),
+    ],
+)
+def test_model_person_inside_a_name_field_label_is_suppressed(text, pieces):
+    results = [_result("PERSON", start, end, 0.97, SOURCE_NER) for start, end in pieces]
+
+    assert merge_results(text, results).results == ()
+
+
+def test_name_after_a_field_label_is_kept():
+    text = "Ф.И.О.: Петров Иван Сергеевич"
+    label_piece = _result("PERSON", 0, 4, 0.77, SOURCE_NER)
+    dot = _result("PERSON", 5, 6, 0.98, SOURCE_NER)
+    name = _result("PERSON", 8, len(text), 0.99, SOURCE_NER)
+
+    assert _summary(merge_results(text, [label_piece, dot, name])) == [
+        ("PERSON", 8, len(text), 0.99)
+    ]
+
+
+@pytest.mark.parametrize(
+    ("text", "value", "expected"),
+    [
+        ("Компания ООО Вектор. Иван Петров получил письмо.", "ООО Вектор.", "ООО Вектор"),
+        ("ООО Вектор; Иван Петров подписал документ.", "ООО Вектор;", "ООО Вектор"),
+        ("Организация Northwind Research Ltd. получила письмо.", "Организация Northwind Research Ltd",
+         "Northwind Research Ltd"),
+        ("Договор с ООО Вектор И.", "ООО Вектор И.", "ООО Вектор И."),
+    ],
+)
+def test_model_organization_drops_closing_punctuation_and_generic_noun(text, value, expected):
+    start = text.index(value)
+    organization = _result("ORGANIZATION", start, start + len(value), 0.9, SOURCE_NER)
+
+    assert [(text[r.start:r.end]) for r in merge_results(text, [organization]).results] == [expected]
+
+
+def test_instruction_tail_cut_inside_the_word_is_removed_at_a_sentence_start():
+    text = "Компания ООО Вектор. Верни ровно MODEL_OK."
+    value = "ООО Вектор. Верн"
+    start = text.index(value)
+    organization = _result("ORGANIZATION", start, start + len(value), 0.9, SOURCE_NER)
+
+    outcome = merge_results(text, [organization], sentence_starts=[0, text.index("Верни")])
+
+    assert [(text[r.start:r.end]) for r in outcome.results] == ["ООО Вектор"]
+
+
+@pytest.mark.parametrize(("text", "value"), [("Новости Yahoo ! за день", "Yahoo !"),
+                                              ("Газета Городские вести . Выпуск", "Городские вести ."),
+                                              ("Сервис Yahoo! работает", "Yahoo!")])
+def test_model_organization_keeps_spaced_or_brand_punctuation(text, value):
+    start = text.index(value)
+    organization = _result("ORGANIZATION", start, start + len(value), 0.9, SOURCE_NER)
+
+    assert [(text[r.start:r.end]) for r in merge_results(text, [organization]).results] == [value]
