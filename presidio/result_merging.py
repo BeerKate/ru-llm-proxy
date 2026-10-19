@@ -383,10 +383,15 @@ def merge_results(
                 )
             )
             continue
-        if (
-            source == SOURCE_NER
-            and result.entity_type == "ORGANIZATION"
-            and _cuts_code_identifier(text, result.start, result.end)
+        identifier = (
+            _cut_code_identifier(text, result.start, result.end)
+            if source == SOURCE_NER and result.entity_type == "ORGANIZATION"
+            else None
+        )
+        if identifier is not None and not any(
+            _spans_overlap(other.start, other.end, *identifier)
+            for other in results
+            if other.entity_type != "ORGANIZATION" or detection_source(other) != SOURCE_NER
         ):
             decisions.append(
                 MergeDecision("ner_identifier_fragment_suppressed", SOURCE_NONE, SOURCE_NER)
@@ -595,13 +600,15 @@ def _balance_name_quotes(text: str, start: int, end: int) -> tuple[int, int]:
     return start, end
 
 
-def _cuts_code_identifier(text: str, start: int, end: int) -> bool:
-    """Whether a span boundary falls inside a Latin code identifier.
+def _cut_code_identifier(text: str, start: int, end: int) -> tuple[int, int] | None:
+    """Return the Latin code identifier a span boundary falls inside, if any.
 
     A model organization that starts or ends in the middle of ``TensorFlow``,
     ``UniSpeechSatForCTC`` or ``user_service`` is a fragment of a code symbol,
     not a company name; masking it would also corrupt the identifier. Whole
-    words and Cyrillic text are never affected.
+    words and Cyrillic text are never affected. The caller keeps the fragment
+    when any other detection touches the same run: a model may split a secret
+    into SECRET_KEY and ORGANIZATION pieces, and every piece must stay masked.
     """
     for inside, outside in ((start, start - 1), (end - 1, end)):
         if not 0 <= outside < len(text) or not start <= inside < end:
@@ -614,8 +621,8 @@ def _cuts_code_identifier(text: str, start: int, end: int) -> bool:
         while run_end < len(text) and text[run_end] in _IDENTIFIER_CHARACTERS:
             run_end += 1
         if _IDENTIFIER_SHAPE_RE.search(text[run_start:run_end]):
-            return True
-    return False
+            return run_start, run_end
+    return None
 
 
 def _recognizer_name(result: RecognizerResult) -> str:

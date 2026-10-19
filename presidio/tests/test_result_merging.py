@@ -602,3 +602,20 @@ def test_name_start_moves_off_a_backslash_escape_letter():
     assert _summary(merge_results(text, [ner, escape_only])) == [
         ("ORGANIZATION", start + 1, text.index('"}'), 0.9)
     ]
+
+
+def test_organization_piece_of_a_split_secret_stays_masked():
+    text = "token: DHYdN9XeCevnykcwVsxZg"
+    start = text.index("DH")
+    pieces = [
+        _result("SECRET_KEY", start, start + 2, 0.9, SOURCE_NER),
+        _result("ORGANIZATION", start + 2, start + 6, 0.5, SOURCE_NER),
+        _result("SECRET_KEY", start + 6, len(text), 0.9, SOURCE_NER),
+    ]
+
+    outcome = merge_results(text, pieces)
+
+    covered = set()
+    for result in outcome.results:
+        covered.update(range(result.start, result.end))
+    assert set(range(start, len(text))) <= covered
