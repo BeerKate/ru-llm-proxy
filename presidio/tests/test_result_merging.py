@@ -494,3 +494,42 @@ def test_additive_address_rule_completes_a_partial_native_address():
         ("RU_ADDRESS", text.index("ул."), text.index(", кв."), 0.85),
         ("RU_ADDRESS", text.index(", кв."), len(text), 0.75),
     ]
+
+
+@pytest.mark.parametrize(
+    ("text", "value"),
+    [
+        ('__all__ = ["UniSpeechSatForCTC"]', "Uni"),
+        ('__all__ = ["UniSpeechSatForCTC"]', "UniSpeechSatForC"),
+        ("name: Name for the TensorFlow ops.", "TensorF"),
+        ('"Qwen2ForCausalLM",', "alLM"),
+        ("service = user_service_factory()", "service_fact"),
+    ],
+)
+def test_model_organization_cutting_a_code_identifier_is_suppressed(text, value):
+    start = text.index(value)
+    ner = _result("ORGANIZATION", start, start + len(value), 0.9, SOURCE_NER)
+
+    outcome = merge_results(text, [ner])
+
+    assert outcome.results == ()
+    assert [d.reason for d in outcome.decisions] == ["ner_identifier_fragment_suppressed"]
+
+
+@pytest.mark.parametrize(
+    ("text", "value", "entity_type"),
+    [
+        ("# Copyright 2024 The HuggingFace Inc. team.", "HuggingFace Inc", "ORGANIZATION"),
+        ("author: BeerKate", "BeerKate", "ORGANIZATION"),
+        ("Договор с ООО «РомашкаСервис» подписан", "РомашкаСер", "ORGANIZATION"),
+        ("Smiths family", "Smith", "ORGANIZATION"),
+        ("class PetrovReport:", "Petrov", "PERSON"),
+    ],
+)
+def test_whole_words_cyrillic_and_other_types_are_not_identifier_fragments(text, value, entity_type):
+    start = text.index(value)
+    ner = _result(entity_type, start, start + len(value), 0.9, SOURCE_NER)
+
+    assert _summary(merge_results(text, [ner])) == [
+        (entity_type, start, start + len(value), 0.9)
+    ]

@@ -101,6 +101,11 @@ _DATE_LIKE_RE = re.compile(r"\d{1,2}[./-]\d{1,2}[./-]\d{2,4}")
 _DOTTED_VERSION_RE = re.compile(r"\d{1,3}(?:\.\d{1,3}){1,3}")
 _SENTENCE_BOUNDARIES = frozenset(".!?;。！？")
 _NAME_TYPES = frozenset({"PERSON", "ORGANIZATION"})
+_IDENTIFIER_CHARACTERS = frozenset(
+    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_"
+)
+# camelCase, ACRONYMWord, snake_case or letters mixed with digits.
+_IDENTIFIER_SHAPE_RE = re.compile(r"[a-z][A-Z]|[A-Z]{2}[a-z]|_|[A-Za-z][0-9]|[0-9][A-Za-z]")
 # Generic model predictions that never correct another detection's boundaries.
 _STATISTICAL_RECOGNIZERS = frozenset({"SpacyRecognizer"})
 # Rules that only add coverage; their open parts survive any overlap.
@@ -368,6 +373,15 @@ def merge_results(
                 )
             )
             continue
+        if (
+            source == SOURCE_NER
+            and result.entity_type == "ORGANIZATION"
+            and _cuts_code_identifier(text, result.start, result.end)
+        ):
+            decisions.append(
+                MergeDecision("ner_identifier_fragment_suppressed", SOURCE_NONE, SOURCE_NER)
+            )
+            continue
         if source == SOURCE_NER and result.entity_type == "CONTRACT_NUMBER":
             confirmed = any(
                 _spans_overlap(result.start, result.end, start, end)
@@ -494,6 +508,29 @@ def merge_results(
 
     kept.sort(key=lambda result: (result.start, result.end, result.entity_type))
     return MergeOutcome(tuple(kept), tuple(decisions))
+
+
+def _cuts_code_identifier(text: str, start: int, end: int) -> bool:
+    """Whether a span boundary falls inside a Latin code identifier.
+
+    A model organization that starts or ends in the middle of ``TensorFlow``,
+    ``UniSpeechSatForCTC`` or ``user_service`` is a fragment of a code symbol,
+    not a company name; masking it would also corrupt the identifier. Whole
+    words and Cyrillic text are never affected.
+    """
+    for inside, outside in ((start, start - 1), (end - 1, end)):
+        if not 0 <= outside < len(text) or not start <= inside < end:
+            continue
+        if text[inside] not in _IDENTIFIER_CHARACTERS or text[outside] not in _IDENTIFIER_CHARACTERS:
+            continue
+        run_start, run_end = min(inside, outside), max(inside, outside) + 1
+        while run_start > 0 and text[run_start - 1] in _IDENTIFIER_CHARACTERS:
+            run_start -= 1
+        while run_end < len(text) and text[run_end] in _IDENTIFIER_CHARACTERS:
+            run_end += 1
+        if _IDENTIFIER_SHAPE_RE.search(text[run_start:run_end]):
+            return True
+    return False
 
 
 def _recognizer_name(result: RecognizerResult) -> str:
