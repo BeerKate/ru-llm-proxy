@@ -92,7 +92,9 @@ def check_base64_policy(analyzer_url, proxy_url, block_proxy_url, capture_url):
 
 def check_chunk_boundaries(analyzer_url, proxy_url, block_proxy_url, capture_url):
     cases = [
-        ("long", "Base64", "BASE64_DATA", "", "\n".join(["A" * 64] * 2154), True),
+        # Whitespace is valid inside a declared encoding. Keep this a source-span
+        # boundary test, not an accidental NER load benchmark on repeated tokens.
+        ("long", "Base64", "BASE64_DATA", "", "A" * 64 + "\n" + " " * 140000 + "B" * 64, True),
         ("offset", "payload_b64", "BASE64_DATA", " " * 115000, "A" * 20000, False),
         ("multiline", "password_b64", "PASSWORD", " " * 115000,
          "A" * 10000 + "\n    " + "B" * 10000, True),
