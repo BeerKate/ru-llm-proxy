@@ -17,11 +17,12 @@ vocab.txt
 положите их в эту папку. Расположение исходного архива и постоянное хранилище
 весов должны быть согласованы до промышленной сборки.
 
-Затем соберите образ с профилем:
+Затем соберите и запустите стек с профилем
+([развёртывание](../../../docs/deployment.md#tiny2)):
 
 ```bash
-NER_MODEL_PROFILE=tiny2 docker compose build presidio-analyzer
-NER_MODEL_PROFILE=tiny2 docker compose up -d presidio-analyzer
+make build ANALYZER_PROFILE=tiny2
+make up STACK=litellm-presidio ANALYZER_PROFILE=tiny2
 ```
 
 При сборке каждый файл сверяется с размером и SHA-256 из манифеста; при
