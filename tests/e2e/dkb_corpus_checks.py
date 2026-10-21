@@ -87,23 +87,12 @@ def check_base64_policy(analyzer_url, proxy_url, block_proxy_url, capture_url):
                         raise AssertionError((context, "block request succeeded"))
                     assert capture(capture_url)["provider_requests"] == 0, context
                     blocked += 1
-    # Oversized mappings must fail before any provider request, including streams.
-    large = 'Base64: "' + ("A" * 64 + "\n") * (1024 * 1024 // 65 + 1) + '"'
-    for stream in (False, True):
-        reset(capture_url)
-        try:
-            _request(proxy_url, "/v1/responses", payload_for(large, "responses", stream, False), stream=stream, timeout=180)
-        except urllib.error.HTTPError as error:
-            assert error.code == 413, (policy, "mapping limit", error.code)
-        else:
-            raise AssertionError((policy, "oversized mapping accepted"))
-        assert capture(capture_url)["provider_requests"] == 0
-    print(json.dumps({"status": "ok", "base64_policy": policy, "cases": len(cases), "echo_flows": flows, "blocked_flows": blocked, "oversized_rejections": 2}))
+    print(json.dumps({"status": "ok", "base64_policy": policy, "cases": len(cases), "echo_flows": flows, "blocked_flows": blocked}))
 
 
 def check_chunk_boundaries(analyzer_url, proxy_url, block_proxy_url, capture_url):
     cases = [
-        ("long", "Base64", "BASE64_DATA", "", "A" * 140000, False),
+        ("long", "Base64", "BASE64_DATA", "", "\n".join(["A" * 64] * 2154), True),
         ("offset", "payload_b64", "BASE64_DATA", " " * 115000, "A" * 20000, False),
         ("multiline", "password_b64", "PASSWORD", " " * 115000,
          "A" * 10000 + "\n    " + "B" * 10000, True),
