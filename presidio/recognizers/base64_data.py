@@ -5,6 +5,7 @@ The optional logistic policy adds a document-level cascade on top of it.
 
 import base64
 import binascii
+from bisect import bisect_right
 import os
 import re
 
@@ -157,10 +158,8 @@ class Base64DataRecognizer(EntityRecognizer):
         for key, decoded, offsets in iter_json_keyed_strings(text):
             if not isinstance(key, str) or not _DECLARED_KEY.fullmatch(key) or not decoded.strip():
                 continue
-            first = len(decoded) - len(decoded.lstrip())
-            last = len(decoded.rstrip())
             results.append(self._result(
-                offsets[first], offsets[last], "base64.declared-json", self._declared_type(key)
+                offsets[0], offsets[-1], "base64.declared-json", self._declared_type(key)
             ))
         return results
 
@@ -178,8 +177,15 @@ class Base64DataRecognizer(EntityRecognizer):
             # Keys written with JSON escapes declare the same value as plain keys; the
             # decoded key decides the class even where the raw-text rule saw a key such as u0070assword_base64.
             members = self._declared_json_members(text)
-            spans = {(r.start, r.end) for r in members}
-            declared_results = [r for r in declared_results if (r.start, r.end) not in spans] + members
+            member_starts = [r.start for r in members]
+            retained = []
+            for result in declared_results:
+                index = bisect_right(member_starts, result.start) - 1
+                # A decoded member owns its whole source value, including escaped
+                # whitespace; only declarations contained in that value are replaced.
+                if index < 0 or result.end > members[index].end:
+                    retained.append(result)
+            declared_results = retained + members
         results = [r for r in declared_results if r.entity_type in requested]
         if self.policy != "logistic" or "BASE64_DATA" not in requested:
             return results

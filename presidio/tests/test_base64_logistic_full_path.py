@@ -41,6 +41,13 @@ def analyze(api, text, entities=None):
 VALUE = "U3ludGhldGljLVBhc3N3b3JkLTIwMjY="  # synthetic "Synthetic-Password-2026"
 OTHER = "b3JkaW5hcnkgdGV4dCB3aXRob3V0IHNlY3JldHM="  # synthetic ordinary text
 DECLARED_KEYS = ["password_base64", "secret_key_base64", "login_base64", "auth_token_base64", "api_key_base64"]
+DECLARED_TYPES = [
+    ("password_base64", "PASSWORD"),
+    ("secret_key_base64", "SECRET_KEY"),
+    ("login_base64", "LOGIN"),
+    ("auth_token_base64", "AUTH_TOKEN"),
+    ("api_key_base64", "SECRET_KEY"),
+]
 
 
 def declared_documents():
@@ -96,3 +103,36 @@ def test_excluded_declared_types_are_not_reclassified(results, name, text):
     if name.startswith(tuple(DECLARED_KEYS)):
         assert declared, "synthetic documents must contain a declared credential"
         assert any(start <= text.index(OTHER) < end for _, start, end in results["filtered", name])
+
+
+@pytest.mark.parametrize("key,kind", DECLARED_TYPES)
+@pytest.mark.parametrize("escaped_position", [None, 0, -1])
+@pytest.mark.parametrize("left,right", [
+    ("", ""), (" ", " "), (r"\n", r"\n"),
+    (r"\u0020", r"\u0020"), (r"\t", r"\r\n"),
+])
+def test_json_member_owns_escaped_whitespace_and_keeps_filter(
+    monkeypatch, key, kind, escaped_position, left, right,
+):
+    api = client(monkeypatch, "logistic")
+    if escaped_position is not None:
+        index = key.index("base64") if escaped_position == -1 else escaped_position
+        key = key[:index] + r"\u%04x" % ord(key[index]) + key[index + 1:]
+    member = '"%s":"%s%s%s"' % (key, left, VALUE, right)
+    for text in (
+        '{%s,"note":"%s"}' % (member, OTHER),
+        '{"outer":{"items":[{%s}]},"note":"%s"}' % (member, OTHER),
+        '[{"note":"%s"},{%s}]' % (OTHER, member),
+    ):
+        json.loads(text)
+        start, end = text.index(VALUE), text.index(VALUE) + len(VALUE)
+        other = ("BASE64_DATA", text.index(OTHER), text.index(OTHER) + len(OTHER))
+        assert analyze(api, text, ["BASE64_DATA"]) == [other]
+        for entities in (["BASE64_DATA", kind], [kind], None):
+            found = analyze(api, text, entities)
+            matching = [(t, s, e) for t, s, e in found if s < end and start < e]
+            assert len(matching) == 1
+            assert matching[0][0] == kind
+            assert matching[0][1] <= start and end <= matching[0][2]
+            if entities != [kind]:
+                assert other in found

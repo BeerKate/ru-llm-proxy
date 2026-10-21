@@ -26,6 +26,7 @@ ORG_TEXT="Для ООО Север в Туле заданы AUTH_TOKEN=mixed-aut
 IDENTITY_VALUES=("Олег Волков" "oleg.volkov" "Mix3d-Value!" "OV-2026/81")
 ORG_VALUES=("ООО Север" "Туле" "mixed-auth-token-00073" "mixed-secret-key-00084")
 export NER_PROXY_CANARIES="Олег Волков,oleg.volkov,Mix3d-Value!,OV-2026/81,ООО Север,Туле,mixed-auth-token-00073,mixed-secret-key-00084"
+NER_PROXY_CANARIES+=",U3ludGhldGljLVBhc3N3b3JkLTIwMjY=,YUBiLnJ1,c3ludGhldGljLWJpbmFyeS0AAQItMDIwMjY=,Qr3yIQbw"
 NER_PROXY_CANARIES+=",$(python3 "$ROOT_DIR/tests/e2e/ner_instruction_checks.py" --canaries)"
 export NER_PROXY_MASK_PORT="$MASK_PORT"
 export NER_PROXY_BLOCK_PORT="$BLOCK_PORT"

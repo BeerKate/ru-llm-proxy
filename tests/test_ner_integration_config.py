@@ -69,6 +69,17 @@ def test_proxy_compose_uses_real_analyzer_and_both_pii_modes():
     assert "FINAL_PAYLOAD_LEAK_CHECK_MODE=block" in compose
 
 
+def test_logistic_policy_runs_full_proxy_gate_in_ci():
+    workflow = yaml.safe_load(_read(WORKFLOW))
+    steps = workflow["jobs"]["real-model-integration"]["steps"]
+    assert any(
+        step.get("env", {}).get("PRESIDIO_ANALYZER_BASE64_POLICY") == "logistic"
+        and step.get("run") == "bash tests/e2e/test_ner_proxy_flow.sh"
+        for step in steps
+    )
+    assert "PRESIDIO_ANALYZER_BASE64_POLICY=${PRESIDIO_ANALYZER_BASE64_POLICY:-content}" in _read(COMPOSE)
+
+
 def test_proxy_config_enables_pre_and_post_call_hooks():
     config = _read(CONFIG)
     parsed = yaml.safe_load(config)

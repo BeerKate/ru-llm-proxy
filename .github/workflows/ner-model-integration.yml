@@ -92,3 +92,8 @@ jobs:
 
       - name: Run real Analyzer proxy flow
         run: make test-ner-proxy
+
+      - name: Run real Analyzer proxy flow with logistic Base64
+        env:
+          PRESIDIO_ANALYZER_BASE64_POLICY: logistic
+        run: bash tests/e2e/test_ner_proxy_flow.sh
