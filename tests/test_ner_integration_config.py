@@ -80,6 +80,12 @@ def test_logistic_policy_runs_full_proxy_gate_in_ci():
     assert "PRESIDIO_ANALYZER_BASE64_POLICY=${PRESIDIO_ANALYZER_BASE64_POLICY:-content}" in _read(COMPOSE)
 
 
+def test_base64_regressions_are_in_the_existing_api_ci_gate():
+    target = _read(ROOT / "Makefile").split("test-recognizer-api:", 1)[1].split("\ntest-ner-evaluation:", 1)[0]
+    for path in (ROOT / "presidio/tests").glob("test_base64_*.py"):
+        assert str(path.relative_to(ROOT)) in target
+
+
 def test_proxy_config_enables_pre_and_post_call_hooks():
     config = _read(CONFIG)
     parsed = yaml.safe_load(config)

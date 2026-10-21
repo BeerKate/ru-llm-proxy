@@ -90,7 +90,7 @@ def run(base="http://localhost:4000", key="sk-test-master"):
             "model": "mock-chat", "input": large, "stream": stream,
         })
         assert status == 413, ("oversized mapping", stream, status)
-        assert large not in body, "Oversized mapping error exposed the source"
+        assert large[:72] not in body and "a" * 64 not in body, "Oversized mapping error exposed the source"
         count += 1
     with urllib.request.urlopen("http://mock-upstream:8080/capture", timeout=5) as result:
         assert json.load(result)["provider_requests"] == before, "Oversized mapping reached provider"
