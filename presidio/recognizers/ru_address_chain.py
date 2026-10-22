@@ -60,7 +60,7 @@ KEY_RULE = re.compile(
     r'(?i)(?<![A-Za-z_])["\']?(?P<key>(?:registration_|postal_|home_|delivery_|legal_|fact_|actual_)?'
     r'(?:address|addr|city|street|house|flat|apartment|building|region|district|settlement|zip|postcode|'
     r'адрес|город|улица|дом|квартира|регион|район|индекс))["\']?[ \t]*[:=][ \t]*'
-    r'(?P<q>["\'`])(?P<value>[^"\'`\n]{1,200})(?P=q)')
+    r'(?P<q>["\'`])(?P<value>(?:\\[^\n]|(?!(?P=q))[^\\\n]){1,200})(?P=q)')
 ADDRESS_CONTEXT = re.compile(r'(?i)(?:адрес\w*|address|addr|проживает|прописан\w*|живу|живёт|зарегистрирован\w*|'
                              r'доставк\w*|delivery|shipping)[^\n]{0,12}?(?=[ \t:="\'`(]|$)')
 NOT_STREET = (r'(?!(?:Раздел|Глава|Пункт|Статья|Приложение|Таблица|Рисунок|Рис|Версия|Шаг|Этап|Пример|Страница|'

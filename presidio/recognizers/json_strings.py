@@ -88,9 +88,9 @@ class JsonStringRecognizer(EntityRecognizer):
             name="JsonStringRecognizer",
             version="1.0.0",
         )
-        from recognizers import PLAIN_RECOGNIZERS
+        from recognizers import PLAIN_RECOGNIZERS, ADDITIVE_RECOGNIZERS
         from recognizers.base64_data import Base64DataRecognizer
-        self._recognizers = [cls() for cls in PLAIN_RECOGNIZERS] + [Base64DataRecognizer()]
+        self._recognizers = [cls() for cls in [*PLAIN_RECOGNIZERS, *ADDITIVE_RECOGNIZERS]] + [Base64DataRecognizer()]
         self._fields = [PasswordRecognizer(), SecretKeyRecognizer(), AuthTokenRecognizer(), LoginRecognizer(), Base64DataRecognizer()]
 
     def load(self):
@@ -113,8 +113,15 @@ class JsonStringRecognizer(EntityRecognizer):
                 value_start = match.end() + delimiter.end()
                 continue
             decoded, offsets = decoded_string_offsets(text, match.start(), match.end())
-            if match.start() == value_start and not _is_inert_credential_value(decoded):
+            if match.start() == value_start and decoded:
                 for recognizer in self._fields:
+                    accepted = not _is_inert_credential_value(decoded)
+                    if isinstance(recognizer, PasswordRecognizer):
+                        accepted = accepted or recognizer._accept_match(
+                            decoded, "credential.kv.password", json.dumps(decoded), ""
+                        ) or not decoded.strip()
+                    if not accepted:
+                        continue
                     if not set(recognizer.supported_entities) & set(entities or self.supported_entities):
                         continue
                     for finding in recognizer.analyze(f'{key}="synthetic-value-123"', entities):
@@ -137,6 +144,7 @@ class JsonStringRecognizer(EntityRecognizer):
                         continue
                     metadata = dict(finding.recognition_metadata or {})
                     metadata["json_string_projection"] = True
+                    metadata["projected_recognizer_name"] = recognizer.name
                     # Presidio associates results with registered recognizer instances.
                     metadata[RecognizerResult.RECOGNIZER_NAME_KEY] = self.name
                     metadata[RecognizerResult.RECOGNIZER_IDENTIFIER_KEY] = self.id

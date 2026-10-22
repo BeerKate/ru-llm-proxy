@@ -187,6 +187,7 @@ test-recognizer-api:
 	docker compose run $(PYTEST_DOCKER_FLAGS) presidio-analyzer-tests \
 		$(PYTEST) \
 		presidio/tests/test_result_merging.py \
+		presidio/tests/test_string_boundaries.py \
 		presidio/tests/test_credential_rules.py \
 		presidio/tests/test_encoded_secrets.py \
 		presidio/tests/test_analyzer_api_thresholds.py \

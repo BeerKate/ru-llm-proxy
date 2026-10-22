@@ -68,8 +68,8 @@ PLAIN_RECOGNIZERS = [
     SqlCredentialRecognizer,
 ]
 
-# Additive address/passport shapes run on the request text only, not inside
-# decoded JSON strings, as validated on the 2026-10-14 lab run.
+# Additive shapes run on source text and decoded JSON values; source ranges
+# are projected back without changing the original JSON representation.
 ADDITIVE_RECOGNIZERS = [RuAddressChainRecognizer, RuPassportExtRecognizer]
 
 ALL_RECOGNIZERS = [

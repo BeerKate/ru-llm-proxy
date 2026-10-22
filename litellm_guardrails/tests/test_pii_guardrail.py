@@ -1657,6 +1657,26 @@ class TestDependencyClients:
 
 
 class TestMaskText:
+    @pytest.mark.parametrize("field,value", [
+        ("password", '\"'),
+        ("password", "\\"),
+        ("password", "😀\\\""),
+        ("address", 'ул. Ленина, д. 5, кв. "12"'),
+    ])
+    def test_json_escapes_mask_and_restore_exact_source(self, guardrail, field, value):
+        # Analyzer-side tests verify these source-coordinate boundaries separately.
+        # Keep the guardrail image independent of Analyzer/model dependencies.
+        text = json.dumps({field: value, "next": {"x": 1}})
+        raw_value = json.dumps(value)[1:-1]
+        start = text.index(raw_value)
+        entities = [{"entity_type": "PASSWORD" if field == "password" else "RU_ADDRESS",
+                     "start": start, "end": start + len(raw_value), "score": .95}]
+        masked, mapping = guardrail._mask_text(text, entities)
+        assert mapping
+        assert json.loads(masked)["next"] == {"x": 1}
+        assert json.loads(masked)[field] != value
+        assert pii_guardrail.restore_text(masked, mapping).encode() == text.encode()
+
     def test_masks_with_unique_placeholders_for_same_type(self, guardrail):
         text = "Телефоны +79031234567 и 89031234567"
         entities = [

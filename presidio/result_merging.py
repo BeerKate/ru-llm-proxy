@@ -9,6 +9,7 @@ from functools import lru_cache
 from typing import Iterable
 
 from presidio_analyzer import RecognizerResult
+from string_spans import StringSpans
 
 
 DETECTION_SOURCE_METADATA_KEY = "ru_llm_detection_source"
@@ -335,7 +336,32 @@ def merge_results(
     valid_results = []
     contract_evidence = contract_context_evidence(text)
     reference_spans = []
-    results = list(results)
+    strings = StringSpans(text)
+    normalized = []
+    for result in results:
+        if not _valid_span(result, len(text)):
+            normalized.append(result)  # Preserve the existing invalid-span decision.
+            continue
+        literal = strings.at(result.start)
+        # Existing specialized rules may deliberately cover a concatenated key
+        # across several code literals. Keep that established native contract;
+        # only statistical/additive findings may need clipping to one value.
+        clip = (
+            detection_source(result) == SOURCE_NER
+            or _recognizer_name(result) in _ADDITIVE_RECOGNIZERS
+        )
+        bounds = (result.start, result.end)
+        if clip or literal is None or result.end <= literal.end:
+            bounds = strings.align(
+                result.start, result.end,
+                name=result.entity_type in _JOINED_NAME_TYPES, infer=clip,
+            )
+        if bounds:
+            normalized.append(
+                result if bounds == (result.start, result.end)
+                else _copy_name(result, start=bounds[0], end=bounds[1])
+            )
+    results = normalized
     # The experimental cascade adds coverage; it must never compete with native
     # credential or NER findings for ownership of their existing ranges.
     logistic_results = [r for r in results if _is_logistic_base64(r)]
@@ -353,7 +379,7 @@ def merge_results(
             )
             continue
         if result.entity_type in _JOINED_NAME_TYPES:
-            trimmed = _skip_escape_letter(text, result)
+            trimmed = result if strings.at(result.start) else _skip_escape_letter(text, result)
             if trimmed is None:
                 decisions.append(MergeDecision("name_escape_letter_dropped", SOURCE_NONE, source))
                 continue
@@ -545,7 +571,7 @@ def merge_results(
         decisions.append(
             MergeDecision("overlap_fragment_kept", detection_source(fragment), SOURCE_NONE)
         )
-    kept, joined = _join_name_fragments(text, kept)
+    kept, joined = _join_name_fragments(text, kept, strings)
     decisions.extend(
         MergeDecision("name_fragments_joined", detection_source(r), detection_source(r))
         for r in joined
@@ -595,7 +621,12 @@ def _skip_escape_letter(text: str, result: RecognizerResult) -> RecognizerResult
     code string; a name that was only that letter is dropped.
     """
     start = result.start
-    if start > 0 and text[start - 1] == "\\" and text[start] in _ESCAPE_LETTERS:
+    backslashes = 0
+    cursor = start - 1
+    while cursor >= 0 and text[cursor] == "\\":
+        backslashes += 1
+        cursor -= 1
+    if backslashes % 2 and text[start] in _ESCAPE_LETTERS:
         start += 1
         if not any(character.isalnum() for character in text[start : result.end]):
             return None
@@ -606,6 +637,7 @@ def _skip_escape_letter(text: str, result: RecognizerResult) -> RecognizerResult
 def _join_name_fragments(
     text: str,
     kept: list[RecognizerResult],
+    strings: StringSpans,
 ) -> tuple[list[RecognizerResult], list[RecognizerResult]]:
     """Join same-type model names split by spaces, quotes or dashes; close edge quotes.
 
@@ -628,6 +660,7 @@ def _join_name_fragments(
             and _is_statistical(last)
             and _is_statistical(result)
             and last.end <= result.start
+            and strings.same_value(last.start, result.start)
             and _NAME_JOIN_GAP_RE.fullmatch(text[last.end : result.start])
         ):
             out[-1] = _copy_name(last, end=result.end, score=max(last.score, result.score))
@@ -642,6 +675,10 @@ def _join_name_fragments(
             initials = _TRAILING_INITIALS_RE.match(text, end)
             if initials is not None:
                 end = initials.end()
+        bounds = strings.align(start, end)
+        if bounds is None:
+            continue
+        start, end = bounds
         previous_end = out[index - 1].end if index > 0 else 0
         next_start = out[index + 1].start if index + 1 < len(out) else len(text)
         if (start, end) != (result.start, result.end) and start >= previous_end and end <= next_start:
@@ -690,7 +727,8 @@ def _cut_code_identifier(text: str, start: int, end: int) -> tuple[int, int] | N
 
 
 def _recognizer_name(result: RecognizerResult) -> str:
-    return str((result.recognition_metadata or {}).get(RecognizerResult.RECOGNIZER_NAME_KEY, ""))
+    metadata = result.recognition_metadata or {}
+    return str(metadata.get("projected_recognizer_name", metadata.get(RecognizerResult.RECOGNIZER_NAME_KEY, "")))
 
 
 def _is_statistical(result: RecognizerResult) -> bool:
