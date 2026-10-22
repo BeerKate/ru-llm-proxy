@@ -189,6 +189,7 @@ test-recognizer-api:
 		presidio/tests/test_result_merging.py \
 		presidio/tests/test_string_boundaries.py \
 		presidio/tests/test_contract_value_scope.py \
+		presidio/tests/test_organization_code_context.py \
 		presidio/tests/test_credential_rules.py \
 		presidio/tests/test_encoded_secrets.py \
 		presidio/tests/test_analyzer_api_thresholds.py \

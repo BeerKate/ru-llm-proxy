@@ -495,6 +495,7 @@ def merge_results(
         from recognizers.credential_rules import credential_reference_spans
         reference_spans = credential_reference_spans(text)
 
+    code_identifiers = None
     for result in results:
         source = detection_source(result)
         if not _valid_span(result, len(text)):
@@ -562,10 +563,13 @@ def merge_results(
             for other in results
             if other.entity_type != "ORGANIZATION" or detection_source(other) != SOURCE_NER
         ):
-            decisions.append(
-                MergeDecision("ner_identifier_fragment_suppressed", SOURCE_NONE, SOURCE_NER)
-            )
-            continue
+            if code_identifiers is None:
+                code_identifiers = _code_identifier_spans(text, strings)
+            if identifier in code_identifiers:
+                decisions.append(
+                    MergeDecision("ner_identifier_fragment_suppressed", SOURCE_NONE, SOURCE_NER)
+                )
+                continue
         if source == SOURCE_NER and result.entity_type == "CONTRACT_NUMBER":
             confirmed = any(
                 _spans_overlap(result.start, result.end, start, end)
@@ -826,14 +830,11 @@ def _balance_name_quotes(text: str, start: int, end: int) -> tuple[int, int]:
 
 
 def _cut_code_identifier(text: str, start: int, end: int) -> tuple[int, int] | None:
-    """Return the Latin code identifier a span boundary falls inside, if any.
+    """Return a containing Latin identifier, without asserting that it is code.
 
-    A model organization that starts or ends in the middle of ``TensorFlow``,
-    ``UniSpeechSatForCTC`` or ``user_service`` is a fragment of a code symbol,
-    not a company name; masking it would also corrupt the identifier. Whole
-    words and Cyrillic text are never affected. The caller keeps the fragment
-    when any other detection touches the same run: a model may split a secret
-    into SECRET_KEY and ORGANIZATION pieces, and every piece must stay masked.
+    Shape only identifies a possible cut. The caller separately requires a
+    proven code-symbol span and keeps any run touched by another detection.
+    Whole words and Cyrillic text are never suppressed by this rule.
     """
     for inside, outside in ((start, start - 1), (end - 1, end)):
         if not 0 <= outside < len(text) or not start <= inside < end:
@@ -848,6 +849,125 @@ def _cut_code_identifier(text: str, start: int, end: int) -> tuple[int, int] | N
         if _IDENTIFIER_SHAPE_RE.search(text[run_start:run_end]):
             return run_start, run_end
     return None
+
+
+def _code_identifier_spans(text: str, strings: StringSpans) -> set[tuple[int, int]]:
+    """Prove local symbol roles in valid Python and explicit Python fences.
+
+    A string value/comment, bare word, or an unrelated code block is not proof.
+    Parsing never evaluates source; invalid/unknown syntax conservatively keeps
+    the detection. Only targets, callable names, imports, declarations and
+    literal __all__ export entries are eligible, not arbitrary data expressions.
+    """
+    import ast
+    import tokenize
+
+    parts = [(0, text)]
+    for match in re.finditer(
+        r"(?m)^[ \t]*```(?:python|py)[ \t]*\r?\n(?P<code>[\s\S]*?)^[ \t]*```[ \t]*\r?$",
+        text,
+    ):
+        if strings.at(match.start()) is None:
+            parts.append((match.start("code"), match.group("code")))
+    spans = set()
+    for base, source in parts:
+        try:
+            tree = ast.parse(source)
+        except (SyntaxError, ValueError, RecursionError):
+            continue
+        # Python source lines use CR/LF, not every Unicode separator recognized
+        # by str.splitlines() (e.g. a form feed inside a string literal).
+        lines = re.findall(r"[^\r\n]*(?:\r\n|\r|\n|$)", source)
+        starts = [0]
+        for line in lines:
+            starts.append(starts[-1] + len(line))
+
+        byte_columns = {}
+
+        def offset(row, column, *, byte_column=False):
+            line = lines[row - 1]
+            if byte_column and not line.isascii():
+                if row not in byte_columns:
+                    mapping = {0: 0}
+                    byte_index = 0
+                    for char_index, char in enumerate(line, 1):
+                        byte_index += len(char.encode("utf-8"))
+                        mapping[byte_index] = char_index
+                    byte_columns[row] = mapping
+                column = byte_columns[row][column]
+            return starts[row - 1] + column
+
+        def bounds(node):
+            return (offset(node.lineno, node.col_offset, byte_column=True),
+                    offset(node.end_lineno, node.end_col_offset, byte_column=True))
+
+        roles = []
+        proved = set()
+        attribute_ends = set()
+
+        def callable_roles(node):
+            while isinstance(node, ast.Attribute):
+                # Do not include arguments of factory(secret).method().
+                attribute_ends.add(bounds(node)[1])
+                node = node.value
+            if isinstance(node, ast.Name):
+                roles.append(bounds(node))
+
+        nodes = list(ast.walk(tree))
+        bare_labels = {
+            id(node.target) for node in nodes
+            if isinstance(node, ast.AnnAssign) and node.value is None
+        }
+        for node in nodes:
+            if (isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store)
+                    and id(node) not in bare_labels):
+                roles.append(bounds(node))
+            elif isinstance(node, ast.Call):
+                callable_roles(node.func)
+            elif isinstance(node, (ast.Import, ast.ImportFrom)):
+                roles.append(bounds(node))
+            elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                start, _ = bounds(node)
+                header = re.compile(
+                    r"(?:async\s+)?(?:def|class)\s+(?P<name>" + re.escape(node.name) + r")\b"
+                ).match(source, start)
+                if header:
+                    roles.append(header.span("name"))
+            if isinstance(node, (ast.Assign, ast.AugAssign)):
+                targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+                if (any(isinstance(t, ast.Name) and t.id == "__all__" for t in targets)
+                        and isinstance(node.value, (ast.List, ast.Tuple, ast.Set))):
+                    for value in node.value.elts:
+                        if not (isinstance(value, ast.Constant) and isinstance(value.value, str)
+                                and value.value.isascii() and value.value.isidentifier()):
+                            continue
+                        left, right = bounds(value)
+                        index = bisect_left(strings.starts, base + left)
+                        if index < len(strings.spans):
+                            literal = strings.spans[index]
+                            if (literal.end <= base + right
+                                    and text[literal.content_start:literal.content_end] == value.value):
+                                proved.add((literal.content_start, literal.content_end))
+        roles.sort()
+        role_starts = [start for start, _ in roles]
+        role_ends = []
+        for _, end in roles:
+            role_ends.append(max(end, role_ends[-1] if role_ends else 0))
+        try:
+            reader = iter(lines)
+            for token in tokenize.generate_tokens(lambda: next(reader, "")):
+                if token.type != tokenize.NAME:
+                    continue
+                start = offset(*token.start)
+                end = offset(*token.end)
+                index = bisect_right(role_starts, start) - 1
+                if end in attribute_ends or (index >= 0 and end <= role_ends[index]):
+                    proved.add((base + start, base + end))
+        except (tokenize.TokenError, IndentationError):
+            # ast.parse already validated syntax; keep any uncertain names.
+            continue
+        spans.update(proved)
+    return spans
 
 
 def _recognizer_name(result: RecognizerResult) -> str:

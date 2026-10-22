@@ -503,8 +503,6 @@ def test_additive_address_rule_completes_a_partial_native_address():
     [
         ('__all__ = ["UniSpeechSatForCTC"]', "Uni"),
         ('__all__ = ["UniSpeechSatForCTC"]', "UniSpeechSatForC"),
-        ("name: Name for the TensorFlow ops.", "TensorF"),
-        ('"Qwen2ForCausalLM",', "alLM"),
         ("service = user_service_factory()", "service_fact"),
     ],
 )
@@ -523,12 +521,14 @@ def test_model_organization_cutting_a_code_identifier_is_suppressed(text, value)
     [
         ("# Copyright 2024 The HuggingFace Inc. team.", "HuggingFace Inc", "ORGANIZATION"),
         ("author: BeerKate", "BeerKate", "ORGANIZATION"),
+        ("name: Name for the TensorFlow ops.", "TensorF", "ORGANIZATION"),
+        ('"Qwen2ForCausalLM",', "alLM", "ORGANIZATION"),
         ("Договор с ООО «РомашкаСервис» подписан", "РомашкаСер", "ORGANIZATION"),
         ("Smiths family", "Smith", "ORGANIZATION"),
         ("class PetrovReport:", "Petrov", "PERSON"),
     ],
 )
-def test_whole_words_cyrillic_and_other_types_are_not_identifier_fragments(text, value, entity_type):
+def test_organizations_without_code_proof_and_other_types_are_preserved(text, value, entity_type):
     start = text.index(value)
     ner = _result(entity_type, start, start + len(value), 0.9, SOURCE_NER)
 
