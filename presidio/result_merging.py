@@ -76,15 +76,26 @@ _CONTRACT_CONTEXT_RE = re.compile(
     r"соглашени(?:е|я|ю|ем|и|й|ям|ями|ях)|"
     r"contracts?|agreements?"
     r")(?![\w])"
-    # Identifier keys with an explicit number suffix (contract_id,
-    # contractNumber, client_contract_no, номер_договора) followed by an
-    # assignment. A bare contract_* key such as contract_address in
-    # smart-contract code, or a type name in prose, is not enough.
-    r"|(?<![^\W_])(?:contract|agreement)s?[_\-.]?(?:id|no|nr|num|number|ref)"
-    r"(?![a-z])(?=[\"'`]?[ \t]*[:=])"
-    r"|(?<![^\W_])(?:номер_договор\w*|nomer_dogovora|"
-    r"dogovora?[_\-.]?(?:id|no|nr|num|nomer|number))(?![a-z])(?=[\"'`]?[ \t]*[:=])"
 )
+# Identifier keys are assignment evidence, never sentence-wide context.
+_CONTRACT_KEY_RE = re.compile(
+    r"(?i)(?<![^\W_])(?:contract|agreement)s?[_\-.]?(?:id|no|nr|num|number|ref)$"
+    r"|(?<![^\W_])(?:номер_договор\w*|nomer_dogovora|"
+    r"dogovora?[_\-.]?(?:id|no|nr|num|nomer|number))$"
+)
+_CONTRACT_ASSIGNMENT_RE = re.compile(
+    r"(?<![\w.\-])(?P<key>\"(?:[^\"\\\r\n]|\\.)+\"|"
+    r"'(?:[^'\\\r\n]|\\.)+'|[A-Za-zА-Яа-яЁё_][\w.\-]*)"
+    r"[ \t]*(?P<op>[:=])(?![:=])[ \t\r\n]*"
+)
+_CONTRACT_LABEL_KEY_RE = re.compile(
+    r"(?i)(?:номер\s+(?:договора|контракта|соглашения)|"
+    r"(?:contract|agreement)\s+(?:number|no\.?|id|ref))"
+)
+_CONTRACT_SCALAR_RE = re.compile(r"[^\s,;{}\[\]():=]+")
+_CONTRACT_KEY_SEPARATOR_RE = re.compile(r"\s*:")
+_CONTRACT_HINT_RE = re.compile(r"(?i)договор|контракт|соглашени|contract|agreement|nomer_dogovora|dogovor|\\u")
+
 _CONTRACT_CANDIDATE_RE = re.compile(
     r"(?<![\w])"
     r"(?P<value>[A-Za-zА-Яа-яЁё0-9]"
@@ -276,40 +287,153 @@ def detection_source(result: RecognizerResult) -> str:
     return SOURCE_STRUCTURAL
 
 
-def contract_context_evidence(text: str) -> tuple[tuple[int, int], ...]:
-    """Return contract-number candidates backed by nearby contract context."""
-    evidence = []
+def _contract_candidates(text):
+    """The existing number policy, independent of how its context is confirmed."""
     for match in _CONTRACT_CANDIDATE_RE.finditer(text):
         value = match.group("value")
         if not any(character.isdigit() for character in value):
             continue
-        normalized_value = value.replace("\u00ad", "")
+        normalized = value.replace("\u00ad", "")
         if (
-            _DATE_LIKE_RE.fullmatch(normalized_value)
-            or _DOTTED_VERSION_RE.fullmatch(normalized_value)
-            or (normalized_value.isdigit() and len(normalized_value) < 6)
+            _DATE_LIKE_RE.fullmatch(normalized)
+            or _DOTTED_VERSION_RE.fullmatch(normalized)
+            or (normalized.isdigit() and len(normalized) < 6)
         ):
             continue
-
         start, end = match.span("value")
         while end > start and text[end - 1] in ".-/\u00ad":
             end -= 1
-        if end - start < 3:
-            continue
+        if end - start >= 3:
+            yield start, end
 
-        context_start = max(0, start - 96)
+
+def _contract_key(key):
+    return bool(_CONTRACT_KEY_RE.search(key) or _CONTRACT_CONTEXT_RE.fullmatch(key)
+                or _CONTRACT_LABEL_KEY_RE.fullmatch(key))
+
+
+def _literal_view(text, literal):
+    """Reuse validated JSON escape projection; leave other language literals raw."""
+    import json
+    from recognizers.json_strings import decoded_string_offsets
+
+    prefix = text[max(0, literal.start - 3):literal.start]
+    raw = re.search(r"(?i)(?<!\w)(?:r|br|rb|fr|rf)$", prefix) is not None
+    if not raw and text[literal.start] == '"':
+        try:
+            json.loads(text[literal.start:literal.end])
+        except (ValueError, RecursionError):
+            pass
+        else:
+            return decoded_string_offsets(text, literal.start, literal.end)
+    return (text[literal.content_start:literal.content_end],
+            range(literal.content_start, literal.content_end + 1))
+
+
+def _contract_bindings(text, strings):
+    """Bind each assignment to one scalar, never to a container or next field."""
+    import ast
+
+    bindings = []
+    keys = []
+    for match in _CONTRACT_ASSIGNMENT_RE.finditer(text):
+        left, right = match.span("key")
+        owner = strings.at(left)
+        if owner is not None and (owner.start, owner.end) != (left, right):
+            # Analyze textual assignments inside a source string in its own view.
+            continue
+        key = match.group("key")
+        quoted = key[0] in "\"'"
+        if quoted:
+            try:
+                key = ast.literal_eval(key)
+            except (ValueError, SyntaxError):
+                continue
+        before = left - 1
+        while before >= 0 and text[before] in " \t":
+            before -= 1
+        structured = (quoted or match.group("op") == "=" or before < 0
+                      or text[before] in "\r\n{[(,;")
+        confirmed = _contract_key(key)
+        keys.append((left, right))
+        start = match.end()
+        literal = strings.at(start)
+        if literal is not None and literal.start == start:
+            decoded, offsets = _literal_view(text, literal)
+            bindings.append((start, literal.end, confirmed, structured, decoded, offsets))
+        else:
+            scalar = _CONTRACT_SCALAR_RE.match(text, start)
+            if scalar:
+                end = scalar.end()
+                bindings.append((start, end, confirmed, structured,
+                                 text[start:end], range(start, end + 1)))
+                if (not quoted and match.group("op") == ":"
+                        and _CONTRACT_CONTEXT_RE.fullmatch(key)
+                        and next(_contract_candidates(text[start:end]), None) is not None):
+                    # A prose label such as "Договоры: AA-... и BB-..." still
+                    # introduces a list. Other assignment values remain scoped
+                    # independently; null/containers never introduce prose.
+                    keys.pop()
+    return bindings, keys
+
+
+def _plain_contract_evidence(text, strings):
+    bindings, keys = _contract_bindings(text, strings)
+    evidence = []
+    for _, _, confirmed, _, decoded, offsets in bindings:
+        if confirmed:
+            evidence.extend((offsets[start], offsets[end])
+                            for start, end in _contract_candidates(decoded))
+
+    key_starts = [start for start, _ in keys]
+    binding_starts = [start for start, *_ in bindings]
+    for start, end in _contract_candidates(text):
+        key_index = bisect_right(key_starts, start) - 1
+        if key_index >= 0 and start < keys[key_index][1]:
+            continue
+        literal = strings.at(start)
+        binding_index = bisect_right(binding_starts, start) - 1
+        if binding_index >= 0:
+            left, right, _, structured, _, _ = bindings[binding_index]
+            if left <= start < right and structured and literal is None:
+                continue
+        context_start = max(0, start - 96, literal.content_start if literal else 0)
         for index in range(start - 1, context_start - 1, -1):
             if _is_sentence_boundary(text, index):
                 context_start = index + 1
                 break
         context = text[context_start:start]
-        has_contract_context = _CONTRACT_CONTEXT_RE.search(context) is not None
-        has_disqualifier = _CONTRACT_DISQUALIFIER_RE.search(context) is not None
-        has_explicit_number = _EXPLICIT_CONTRACT_NUMBER_RE.search(context) is not None
-        if has_contract_context and (not has_disqualifier or has_explicit_number):
+        has_context = False
+        for match in _CONTRACT_CONTEXT_RE.finditer(text, context_start, start):
+            index = bisect_right(key_starts, match.start()) - 1
+            if index >= 0 and match.start() < keys[index][1]:
+                continue
+            if strings.at(match.start()) is literal:
+                has_context = True
+                break
+        disqualified = _CONTRACT_DISQUALIFIER_RE.search(context) is not None
+        explicit = _EXPLICIT_CONTRACT_NUMBER_RE.search(context) is not None
+        if has_context and (not disqualified or explicit):
             evidence.append((start, end))
+    return evidence
 
-    return tuple(dict.fromkeys(evidence))
+
+def contract_context_evidence(
+    text: str, *, _strings: StringSpans | None = None,
+) -> tuple[tuple[int, int], ...]:
+    """Separate assignment-owned values from natural-language contract context."""
+    if _CONTRACT_HINT_RE.search(text) is None:
+        return ()
+    strings = _strings if _strings is not None else StringSpans(text)
+    evidence = _plain_contract_evidence(text, strings)
+    for literal in strings.spans:
+        # Keys are not free-text context for a different value.
+        if _CONTRACT_KEY_SEPARATOR_RE.match(text, literal.end):
+            continue
+        decoded, offsets = _literal_view(text, literal)
+        for start, end in _plain_contract_evidence(decoded, StringSpans(decoded)):
+            evidence.append((offsets[start], offsets[end]))
+    return tuple(sorted(set(evidence)))
 
 
 def _is_sentence_boundary(text: str, index: int) -> bool:
@@ -334,9 +458,9 @@ def merge_results(
         requested_entities = tuple(requested_entities)
     decisions = []
     valid_results = []
-    contract_evidence = contract_context_evidence(text)
-    reference_spans = []
     strings = StringSpans(text)
+    contract_evidence = contract_context_evidence(text, _strings=strings)
+    reference_spans = []
     normalized = []
     for result in results:
         if not _valid_span(result, len(text)):
