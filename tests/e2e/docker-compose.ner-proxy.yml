@@ -35,6 +35,10 @@ services:
   presidio-analyzer:
     image: ${ANALYZER_IMAGE:-ru-llm-proxy-presidio-analyzer:latest}
     pull_policy: never
+    environment:
+      - PRESIDIO_ANALYZER_BASE64_POLICY=${PRESIDIO_ANALYZER_BASE64_POLICY:-content}
+      - OMP_NUM_THREADS=1
+      - MKL_NUM_THREADS=1
     ports:
       - "127.0.0.1:${NER_PROXY_ANALYZER_PORT:-15001}:5001"
     healthcheck:
