@@ -228,3 +228,29 @@ def test_json_above_projection_limit_still_has_safe_mask_boundaries(recognizers)
     assert document['padding'] == 'a' * 66000
     assert document['next'] == 'ordinary'
     assert document['password'] != '"'
+
+
+@pytest.mark.parametrize('projected', [False, True])
+def test_later_address_can_cover_a_trimmed_ner_remainder_inside_json(projected):
+    from result_merging import SOURCE_STRUCTURAL
+
+    value = 'password=Alpha42&tail ул. Ленина, д. 5'
+    text = json.dumps({'source': value, 'next': 'ordinary'}, ensure_ascii=False)
+    value_start = text.index('password=')
+    value_end = text.index('", "next"')
+    native_start = text.index('Alpha42')
+    native = finding('PASSWORD', native_start, native_start + len('Alpha42'), SOURCE_NATIVE_CREDENTIAL)
+    wide = finding('PASSWORD', value_start, value_end)
+    additive = finding('RU_ADDRESS', native_start, value_end, SOURCE_STRUCTURAL)
+    additive.recognition_metadata[RecognizerResult.RECOGNIZER_NAME_KEY] = (
+        'JsonStringRecognizer' if projected else 'RuAddressChainRecognizer'
+    )
+    if projected:
+        additive.recognition_metadata['projected_recognizer_name'] = 'RuAddressChainRecognizer'
+    import itertools
+    for order in itertools.permutations([native, wide, additive]):
+        masked, spans = mask_and_restore(text, order)
+        assert json.loads(masked)['next'] == 'ordinary'
+        assert 'Ленина' not in json.loads(masked)['source']
+        assert all(any(r.start <= i < r.end for r in spans)
+                   for i in range(text.index('ул.'), value_end))

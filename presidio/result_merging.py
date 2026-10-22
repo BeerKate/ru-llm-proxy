@@ -808,7 +808,10 @@ def _uncovered_fragments(
                 end -= 1
             if start < end:
                 fragments.append(_copy_name(result, start=start, end=end))
-                covered[index:run_end] = b"\x01" * (run_end - index)
+                # Trimming or glued_right may shorten the uncovered run. Only
+                # the emitted span is covered; later eligible findings still
+                # need to see its unmasked remainder.
+                covered[start:end] = b"\x01" * (end - start)
             index = run_end
     return fragments
 
