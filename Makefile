@@ -190,6 +190,9 @@ test-recognizer-api:
 		presidio/tests/test_string_boundaries.py \
 		presidio/tests/test_contract_value_scope.py \
 		presidio/tests/test_organization_code_context.py \
+		presidio/tests/test_address_key_context.py \
+		presidio/tests/test_additive_address_passport.py \
+		presidio/tests/test_nlp_context_contract.py \
 		presidio/tests/test_credential_rules.py \
 		presidio/tests/test_encoded_secrets.py \
 		presidio/tests/test_analyzer_api_thresholds.py \

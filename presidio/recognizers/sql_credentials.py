@@ -24,6 +24,44 @@ _LITERAL = re.compile(_VALUE, re.I)
 MAX_INSERT_CHARS = 8192
 
 
+def iter_insert_literals(text):
+    """Yield column, source literal match and row scope for validated literal INSERTs."""
+    for insert in _INSERT.finditer(text):
+        columns = insert.group("columns").split(",")
+        if not all(_COLUMN.fullmatch(column) for column in columns):
+            continue
+        columns = [column.strip().strip('"`[]') for column in columns]
+        cursor = insert.end()
+        limit = min(len(text), insert.start() + MAX_INSERT_CHARS)
+        rows = []
+        while cursor < limit:
+            row = _ROW.match(text, cursor, limit)
+            if not row:
+                rows = []
+                break
+            literals = list(_LITERAL.finditer(text, row.start("values"), row.end("values")))
+            if len(literals) != len(columns):
+                rows = []
+                break
+            rows.append((row.start(), literals))
+            cursor = row.end()
+            tail = re.match(r"\s*(?P<delimiter>[,;]|$)", text[cursor:limit])
+            if not tail:
+                rows = []
+                break
+            if not tail.group("delimiter") and limit != len(text):
+                rows = []
+                break
+            cursor += tail.end()
+            if tail.group("delimiter") != ",":
+                break
+        else:
+            rows = []
+        for scope, literals in rows:
+            for column, literal in zip(columns, literals):
+                yield column, literal, scope
+
+
 class SqlCredentialRecognizer(EntityRecognizer):
     """Map explicit SQL columns to literals without evaluating SQL expressions."""
 
@@ -45,53 +83,21 @@ class SqlCredentialRecognizer(EntityRecognizer):
     def analyze(self, text, entities, nlp_artifacts=None):
         requested = set(entities or self.supported_entities)
         results = []
-        for insert in _INSERT.finditer(text):
-            columns = insert.group("columns").split(",")
-            if not all(_COLUMN.fullmatch(column) for column in columns):
+        for column, literal, _scope in iter_insert_literals(text):
+            raw = literal.group()
+            if not raw.startswith("'"):
                 continue
-            columns = [column.strip().strip('"`[]') for column in columns]
-            cursor = insert.end()
-            limit = min(len(text), insert.start() + MAX_INSERT_CHARS)
-            rows = []
-            while cursor < limit:
-                row = _ROW.match(text, cursor, limit)
-                if not row:
-                    rows = []
-                    break
-                literals = list(_LITERAL.finditer(text, row.start("values"), row.end("values")))
-                if len(literals) != len(columns):
-                    rows = []
-                    break
-                rows.append(literals)
-                cursor = row.end()
-                tail = re.match(r"\s*(?P<delimiter>[,;]|$)", text[cursor:limit])
-                if not tail:
-                    rows = []
-                    break
-                if not tail.group("delimiter") and limit != len(text):
-                    rows = []
-                    break
-                cursor += tail.end()
-                if tail.group("delimiter") != ",":
-                    break
-            else:
-                rows = []
-            for literals in rows:
-                for column, literal in zip(columns, literals):
-                    raw = literal.group()
-                    if not raw.startswith("'"):
+            # Keep source spelling (including doubled SQL quotes) for restoration.
+            probe = f"{column}={raw}"
+            for recognizer in self._value_recognizers:
+                for finding in recognizer.analyze(probe, list(requested)):
+                    if finding.start < len(column) + 2:
                         continue
-                    # Keep source spelling (including doubled SQL quotes) for restoration.
-                    probe = f"{column}={raw}"
-                    for recognizer in self._value_recognizers:
-                        for finding in recognizer.analyze(probe, list(requested)):
-                            if finding.start < len(column) + 2:
-                                continue
-                            results.append(RecognizerResult(
-                                entity_type=finding.entity_type,
-                                start=literal.start() + 1,
-                                end=literal.end() - 1,
-                                score=0.95,
-                                recognition_metadata=_recognition_metadata(self, "credential.sql.literal"),
-                            ))
+                    results.append(RecognizerResult(
+                        entity_type=finding.entity_type,
+                        start=literal.start() + 1,
+                        end=literal.end() - 1,
+                        score=0.95,
+                        recognition_metadata=_recognition_metadata(self, "credential.sql.literal"),
+                    ))
         return EntityRecognizer.remove_duplicates(results)
