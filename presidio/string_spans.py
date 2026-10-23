@@ -12,6 +12,10 @@ _PREFIX = re.compile(r'(?i)(?<!\w)(?:r|u|b|f|br|rb|fr|rf)$')
 _HEX = frozenset('0123456789abcdefABCDEF')
 
 
+def _reject_json_constant(value):
+    raise ValueError(f'Invalid JSON constant: {value}')
+
+
 @dataclass(frozen=True)
 class StringSpan:
     start: int
@@ -58,14 +62,52 @@ def _escape_end(text, index, limit, raw):
 
 
 class StringSpans:
-    """One linear lexical pass; logarithmic lookup for each finding."""
+    """Lexical string map with validated JSON recovery in prose."""
 
     def __init__(self, text):
         self.text = text
         spans = []
+        python_source = None
+        containers = []
+
+        def embedded_container(content_start, closing):
+            # An introductory quote can appear to close on a JSON key's quote.
+            # Recover only a complete object/array, not a brace mentioned in data.
+            nonlocal python_source
+            candidate = closing - 1
+            while candidate >= content_start and text[candidate].isspace():
+                candidate -= 1
+            if candidate < content_start or text[candidate] not in '{[':
+                return None
+            if python_source is None:
+                import ast
+                try:
+                    ast.parse(text)
+                except SyntaxError:
+                    python_source = False
+                except (ValueError, RecursionError):
+                    # Uncertain source is not permission to reinterpret literals.
+                    python_source = True
+                else:
+                    python_source = True
+            if python_source:
+                return None
+            import json
+            try:
+                value, end = json.JSONDecoder(parse_constant=_reject_json_constant).raw_decode(text, candidate)
+            except (ValueError, RecursionError):
+                return None
+            return candidate if isinstance(value, (dict, list)) and end > closing else None
+
         index = 0
         while index < len(text):
             if text[index] not in '\"\'':
+                character = text[index]
+                if character in '{[':
+                    containers.append(character)
+                elif character in '}]' and containers:
+                    if containers[-1] == {'}': '{', ']': '['}[character]:
+                        containers.pop()
                 index += 1
                 continue
             opening = index
@@ -74,6 +116,11 @@ class StringSpans:
             while before >= 0 and text[before].isspace():
                 before -= 1
             structured = before < 0 or text[before] in ':=([{,'
+            if (not structured and text[opening] == "'" and opening > 0
+                    and opening + 1 < len(text) and text[opening - 1].isalnum()
+                    and text[opening + 1].isalnum()):
+                index += 1  # An apostrophe inside a prose word is not an opening.
+                continue
             raw = bool(prefix and 'r' in prefix.group().lower())
             quote = text[index] * (3 if text.startswith(text[index] * 3, index) else 1)
             index += len(quote)
@@ -92,12 +139,20 @@ class StringSpans:
                     index += 1
                 boundaries.append(index)
             if text.startswith(quote, index):
+                # Inside a container, a value such as "{" is genuine string
+                # data, even if later values accidentally complete valid JSON.
+                recovery = (embedded_container(content_start, index)
+                            if len(quote) == 1 and not containers else None)
+                if recovery is not None:
+                    index = recovery
+                    continue
                 if structured:
                     spans.append(StringSpan(opening, index + len(quote), content_start,
                                             index, tuple(boundaries), tuple(controls)))
                 index += len(quote)
-            elif index == content_start:
-                index += 1
+            else:
+                # An unclosed introduction must not swallow later valid values.
+                index = opening + len(quote)
         self.spans = tuple(spans)
         self.starts = tuple(span.start for span in spans)
 

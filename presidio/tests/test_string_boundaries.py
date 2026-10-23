@@ -90,6 +90,125 @@ def test_controlled_name_balance_keeps_outer_quote():
     assert json.loads(masked) == {'text': '<MASK_0>'}
 
 
+@pytest.mark.parametrize('prefix', [
+    "Here's the payload: ", "don't change this: ", "O'Reilly's example: ",
+    'Незакрытая кавычка " перед данными: ',
+    'Example: "unfinished introduction ',
+    "Example: 'unfinished introduction ",
+    'Example: "unfinished {broken} introduction ',
+])
+@pytest.mark.parametrize('array', [False, True])
+@pytest.mark.parametrize('ascii_only', [False, True])
+def test_prose_quotes_cannot_hide_embedded_json_boundaries(prefix, array, ascii_only):
+    document = {'password': 'Ж42\\"', 'next': 'ordinary'}
+    raw = json.dumps([document] if array else document, ensure_ascii=ascii_only)
+    text = prefix + raw
+    value = json.dumps(document['password'], ensure_ascii=ascii_only)[1:-1]
+    start = text.index(value); end = start + len(value)
+    masked, _ = mask_and_restore(text, [
+        finding('PASSWORD', start, end, SOURCE_NATIVE_CREDENTIAL),
+        finding('PASSWORD', start, end + 2),
+    ])
+    decoded = json.loads(masked[len(prefix):])
+    decoded = decoded[0] if array else decoded
+    assert decoded == {'password': '<MASK_0>', 'next': 'ordinary'}
+    assert masked[:len(prefix)] == prefix
+
+
+@pytest.mark.parametrize('text', [
+    'parts = ["{", ": 1}"]',
+    'parts = ["[", "]"]',
+    'def sample():\n    return "{", ": 1}"',
+    'value = "{" if ": 1}" else "fallback"',
+    'def sample():\n    return \'{"password":"Synthetic42","x":1}\'',
+    'value = """{"password":"Synthetic42","x":1}"""',
+    'value = r\'{"password":"Synthetic42","x":1}\'',
+    '# Here\'s a comment\nvalue = \'{"password":"Synthetic42","x":1}\'',
+])
+def test_recovery_never_reinterprets_complete_python_literals(text):
+    from string_spans import StringSpans
+
+    ast.parse(text)
+    strings = StringSpans(text)
+    for span in strings.spans:
+        # Every recorded opening must be an actual Python literal opening,
+        # never an inner quote invented by recovery from JSON-looking data.
+        tree = ast.parse(text)
+        literals = [node for node in ast.walk(tree)
+                    if isinstance(node, ast.Constant) and isinstance(node.value, str)]
+        lines = text.splitlines(keepends=True)
+        positions = []
+        for node in literals:
+            positions.append(sum(len(line) for line in lines[:node.lineno-1])
+                             + len(lines[node.lineno-1].encode()[:node.col_offset].decode()))
+        assert span.start in positions or text[max(0,span.start-1):span.start].lower() == 'r'
+
+
+@pytest.mark.parametrize('prefix', [
+    'Payload: ', "Here's the payload: ", 'Example: "unfinished ',
+    "Example: 'unfinished ",
+])
+@pytest.mark.parametrize('parts', [['{', ': 1}'], ['[', ']'], ['{', ': {"x":1}}']])
+def test_recovery_keeps_json_looking_fragments_inside_actual_json_values(prefix, parts):
+    from string_spans import StringSpans
+
+    document = json.dumps({'parts': parts, 'password': 'Synthetic42', 'next': 1})
+    text = prefix + document
+    strings = StringSpans(text)
+    cursor = len(prefix)
+    for value in parts:
+        raw = json.dumps(value)
+        start = text.index(raw, cursor)
+        span = strings.at(start)
+        assert span is not None
+        assert (span.start, span.end) == (start, start + len(raw))
+        cursor = span.end
+    start = text.index('Synthetic42'); end = start + len('Synthetic42')
+    masked, _ = mask_and_restore(text, [finding('PASSWORD', start, end + 2)])
+    assert json.loads(masked[len(prefix):])['parts'] == parts
+
+
+@pytest.mark.parametrize('policy', ['content', 'logistic'])
+def test_api_prose_json_recovery_with_controlled_wide_ner(monkeypatch, policy):
+    from fastapi.testclient import TestClient
+    from presidio import analyzer_server
+
+    monkeypatch.setenv('PRESIDIO_ANALYZER_BASE64_POLICY', policy)
+    monkeypatch.setattr(analyzer_server.ner_recognizer, 'require_ready', lambda: None)
+
+    def wide_ner(text, **kwargs):
+        start = text.index('Synthetic42')
+        return [finding('PASSWORD', start, start + len('Synthetic42') + 2)]
+
+    monkeypatch.setattr(analyzer_server.ner_recognizer, 'analyze', wide_ner)
+    api = TestClient(analyzer_server.app)
+    for prefix in ["Here's the payload: ", 'Example: "unfinished ']:
+        document = '{"password":"Synthetic42","next":"ordinary"}'
+        text = prefix + document
+        response = api.post('/api/v1/analyze', json={
+            'text': text, 'entities': ['PASSWORD'], 'score_threshold': .35,
+        })
+        assert response.status_code == 200
+        masked = text
+        saved = {}
+        for i, result in reversed(list(enumerate(response.json()['entities']))):
+            token = f'<MASK_{i}>'
+            saved[token] = text[result['start']:result['end']]
+            masked = masked[:result['start']] + token + masked[result['end']:]
+        assert json.loads(masked[len(prefix):]) == {'password': '<MASK_0>', 'next': 'ordinary'}
+        for token, value in saved.items():
+            masked = masked.replace(token, value)
+        assert masked.encode() == text.encode()
+
+
+@pytest.mark.parametrize('constant', ['NaN', 'Infinity'])
+def test_recovery_does_not_validate_non_json_numeric_constants(constant):
+    from string_spans import StringSpans
+
+    text = 'Intro " unfinished {"value":' + constant + '}'
+    assert StringSpans(text).at(text.index('value')) is None
+
+
 @pytest.mark.parametrize('escape', [r'\"', r'\\', r'\u041c', r'\ud83d\ude00'])
 def test_every_partial_escape_span_is_indivisible(escape):
     text = '{"value":"' + escape + '","x":1}'
