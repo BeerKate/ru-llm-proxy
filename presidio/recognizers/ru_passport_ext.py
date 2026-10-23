@@ -4,12 +4,14 @@ The native patterns need plain whitespace between series and number. Real text
 often has words or punctuation between them ("серия 4510 номер 123456",
 "45-10 № 123456", "4510-123456") or a glued 10-digit value next to an
 explicit passport word. Ambiguous digit-only shapes are emitted with a low
-score and pass the 0.35 threshold only through Presidio context words.
+score and pass the 0.35 threshold only through nearby passport context in
+the same string value, including decoded JSON values.
 """
 
 import re
 
 from presidio_analyzer import AnalysisExplanation, EntityRecognizer, RecognizerResult
+from string_spans import StringSpans
 
 L = r'(?<![0-9A-Za-zА-Яа-яЁё])'
 R = r'(?![0-9])'
@@ -33,11 +35,14 @@ PATTERNS = [
 class RuPassportExtRecognizer(EntityRecognizer):
     """Recognize separated, labelled and glued passport series and numbers."""
 
-    CONTEXT = ['паспорт', 'загранпаспорт', 'загран', 'серия', 'номер паспорта', 'документ', 'passport', 'удостоверение', 'выдан']
+    _CONTEXT_RE = re.compile(
+        r'(?i)(?<!\w)(?:паспорт[а-яё]*|загранпаспорт[а-яё]*|загран|серия|'
+        r'документ[а-яё]*|passport|удостоверени[а-яё]*|выдан[а-яё]*)(?!\w)'
+    )
 
     def __init__(self, supported_language: str = 'ru'):
         super().__init__(supported_entities=['RU_PASSPORT'], name='RuPassportExtRecognizer',
-                         supported_language=supported_language, context=self.CONTEXT, version='1.0.0')
+                         supported_language=supported_language, context=[], version='1.0.0')
 
     def load(self):
         """No external assets are required."""
@@ -46,11 +51,26 @@ class RuPassportExtRecognizer(EntityRecognizer):
         if entities and 'RU_PASSPORT' not in entities:
             return []
         out = []
+        strings = None
         for name, pattern, score in PATTERNS:
             for m in pattern.finditer(text):
                 digits = re.sub(r'\D', '', m.group('v'))
                 if name in {'separated', 'grouped', 'labelled'} and len(digits) == 10 and not 1 <= int(digits[:2]) <= 99:
                     continue
-                out.append(RecognizerResult('RU_PASSPORT', m.start('v'), m.end('v'), score, AnalysisExplanation(self.name, score),
+                confidence = score
+                if score < 0.35:
+                    if strings is None:
+                        strings = StringSpans(text)
+                    literal = strings.at(m.start('v'))
+                    left = max(0, m.start('v') - 100)
+                    right = min(len(text), m.end('v') + 50)
+                    if literal:
+                        left = max(left, literal.content_start)
+                        right = min(right, literal.content_end)
+                    context = text[left:m.start('v')].rsplit('\n', 1)[-1]
+                    context += ' ' + text[m.end('v'):right].split('\n', 1)[0]
+                    if self._CONTEXT_RE.search(context):
+                        confidence = min(1.0, score + 0.35)
+                out.append(RecognizerResult('RU_PASSPORT', m.start('v'), m.end('v'), confidence, AnalysisExplanation(self.name, confidence),
                                             recognition_metadata={RecognizerResult.RECOGNIZER_NAME_KEY: self.name, 'pattern': name}))
         return out

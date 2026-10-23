@@ -93,3 +93,43 @@ def test_address_look_alikes_stay_visible(analyzer, text):
         if r.entity_type == "RU_ADDRESS"
     }
     assert "RuAddressChainRecognizer" not in names
+
+
+@pytest.mark.parametrize('ascii_only', [False, True])
+@pytest.mark.parametrize('value', ['4510-123456', '45-10 № 123456', '45 10 123 456', '75-1234567'])
+def test_decoded_passport_preserves_explicit_context(analyzer, ascii_only, value):
+    import json
+
+    text = json.dumps({'text': 'Клиент предъявил паспорт ' + value + '.', 'next': 'ordinary'}, ensure_ascii=ascii_only)
+    raw = json.dumps(value, ensure_ascii=ascii_only)[1:-1]
+    assert _covered(analyzer, text, raw, 'RU_PASSPORT')
+
+
+@pytest.mark.parametrize('ascii_only', [False, True])
+@pytest.mark.parametrize('text', ['Build 4510-123456 failed.', 'Заказ 4510-123456 оформлен.', 'Version 45 10 123 456'])
+def test_decoded_passport_needs_its_own_context(analyzer, ascii_only, text):
+    import json
+
+    payload = json.dumps({'note': 'Паспорт клиента', 'text': text}, ensure_ascii=ascii_only)
+    findings = analyzer.analyze(text=payload, language='ru', entities=['RU_PASSPORT'], score_threshold=.35)
+    assert findings == []
+
+
+@pytest.mark.parametrize('ascii_only', [False, True])
+def test_passport_context_does_not_override_request_threshold(analyzer, ascii_only):
+    import json
+
+    payload = json.dumps({'text': 'Паспорт 4510-123456.'}, ensure_ascii=ascii_only)
+    findings = analyzer.analyze(text=payload, language='ru', entities=['RU_PASSPORT'], score_threshold=.9)
+    assert findings == []
+
+
+@pytest.mark.parametrize('ascii_only', [False, True])
+@pytest.mark.parametrize('key', ['паспорт', 'passport'])
+def test_own_passport_key_confirms_only_its_scalar(analyzer, ascii_only, key):
+    import json
+
+    payload = json.dumps({key: '4510-123456', 'text': 'Build 4511-654321 failed.'}, ensure_ascii=ascii_only)
+    findings = analyzer.analyze(text=payload, language='ru', entities=['RU_PASSPORT'], score_threshold=.35)
+    assert findings
+    assert all(payload[r.start:r.end] == '4510-123456' for r in findings)

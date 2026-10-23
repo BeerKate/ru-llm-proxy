@@ -10,6 +10,7 @@ import re
 
 _PREFIX = re.compile(r'(?i)(?<!\w)(?:r|u|b|f|br|rb|fr|rf)$')
 _HEX = frozenset('0123456789abcdefABCDEF')
+_KEY_SEPARATOR = re.compile(r'\s*:')
 
 
 def _reject_json_constant(value):
@@ -69,6 +70,15 @@ class StringSpans:
         spans = []
         python_source = None
         containers = []
+        failed_until = {}
+        sql_literals = {}
+        if re.search(r'(?i)\bINSERT\s+INTO\b', text):
+            # Reuse the bounded, literal-only SQL grammar; do not reinterpret
+            # arbitrary adjacent Python quotes as SQL escaping.
+            from recognizers.sql_credentials import iter_insert_literals
+            sql_literals = {literal.start(): literal.end()
+                            for _, literal, _ in iter_insert_literals(text)
+                            if literal.group().startswith("'")}
 
         def embedded_container(content_start, closing):
             # An introductory quote can appear to close on a JSON key's quote.
@@ -111,6 +121,17 @@ class StringSpans:
                 index += 1
                 continue
             opening = index
+            if opening in sql_literals:
+                end = sql_literals[opening]
+                index += 1
+                boundaries = [index]
+                while index < end - 1:
+                    index += 2 if text.startswith("''", index) else 1
+                    boundaries.append(index)
+                spans.append(StringSpan(opening, end, opening + 1, end - 1,
+                                        tuple(boundaries), ()))
+                index = end
+                continue
             prefix = _PREFIX.search(text, max(0, opening - 3), opening)
             before = (prefix.start() if prefix else opening) - 1
             while before >= 0 and text[before].isspace():
@@ -124,6 +145,8 @@ class StringSpans:
             raw = bool(prefix and 'r' in prefix.group().lower())
             quote = text[index] * (3 if text.startswith(text[index] * 3, index) else 1)
             index += len(quote)
+            if opening < failed_until.get((quote, raw), 0):
+                continue
             content_start = index
             boundaries = [index]
             controls = []
@@ -152,6 +175,8 @@ class StringSpans:
                 index += len(quote)
             else:
                 # An unclosed introduction must not swallow later valid values.
+                # The already-scanned suffix cannot close this same quote mode.
+                failed_until[quote, raw] = index
                 index = opening + len(quote)
         self.spans = tuple(spans)
         self.starts = tuple(span.start for span in spans)
@@ -175,3 +200,24 @@ class StringSpans:
 
     def same_value(self, left, right):
         return self.at(left) is self.at(right)
+
+    def mask_ranges(self, start, end, *, name=False):
+        """Keep precise in-value spans; widen crossing findings to each value."""
+        owner = self.at(start)
+        if owner is not None and end <= owner.end:
+            bounds = owner.align(start, end, name=name)
+            return [bounds] if bounds else []
+        index = max(0, bisect_right(self.starts, start) - 1)
+        touched = []
+        while index < len(self.spans) and self.spans[index].start < end:
+            span = self.spans[index]
+            if span.content_end > start and span.content_start < end:
+                touched.append(span)
+            index += 1
+        values = [span for span in touched
+                  if _KEY_SEPARATOR.match(self.text, span.end) is None]
+        if values:
+            return [(span.content_start, span.content_end) for span in values
+                    if span.content_start < span.content_end]
+        bounds = self.align(start, end, name=name, infer=True)
+        return [bounds] if bounds else []

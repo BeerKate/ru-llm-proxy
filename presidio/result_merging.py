@@ -469,18 +469,24 @@ def merge_results(
         literal = strings.at(result.start)
         # Existing specialized rules may deliberately cover a concatenated key
         # across several code literals. Keep that established native contract;
-        # only statistical/additive findings may need clipping to one value.
-        clip = (
+        # Statistical/additive findings crossing syntax widen to every touched
+        # value instead of losing their tail or masking a service key alone.
+        bound_to_values = (
             detection_source(result) == SOURCE_NER
             or _recognizer_name(result) in _ADDITIVE_RECOGNIZERS
         )
-        bounds = (result.start, result.end)
-        if clip or literal is None or result.end <= literal.end:
+        ranges = [(result.start, result.end)]
+        if bound_to_values:
+            ranges = strings.mask_ranges(
+                result.start, result.end, name=result.entity_type in _JOINED_NAME_TYPES,
+            )
+        elif literal is None or result.end <= literal.end:
             bounds = strings.align(
                 result.start, result.end,
-                name=result.entity_type in _JOINED_NAME_TYPES, infer=clip,
+                name=result.entity_type in _JOINED_NAME_TYPES,
             )
-        if bounds:
+            ranges = [bounds] if bounds else []
+        for bounds in ranges:
             normalized.append(
                 result if bounds == (result.start, result.end)
                 else _copy_name(result, start=bounds[0], end=bounds[1])

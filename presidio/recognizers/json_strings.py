@@ -11,6 +11,7 @@ from recognizers.credential_rules import (
     AuthTokenRecognizer, LoginRecognizer, PasswordRecognizer, SecretKeyRecognizer,
     _is_inert_credential_value,
 )
+from recognizers.ru_passport_ext import RuPassportExtRecognizer
 
 
 MAX_JSON_CHARS = 65536
@@ -140,6 +141,12 @@ class JsonStringRecognizer(EntityRecognizer):
                 if not requested:
                     continue
                 for finding in recognizer.analyze(decoded, list(requested), None):
+                    # An explicit passport key can confirm its own scalar, not
+                    # another member/array item encountered later in the source.
+                    if (isinstance(recognizer, RuPassportExtRecognizer)
+                            and finding.score < 0.35 and match.start() == value_start
+                            and recognizer._CONTEXT_RE.search(key or '')):
+                        finding.score += 0.35
                     if finding.score < 0.35:
                         continue
                     metadata = dict(finding.recognition_metadata or {})
