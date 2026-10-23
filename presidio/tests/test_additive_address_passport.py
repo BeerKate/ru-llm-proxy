@@ -133,3 +133,12 @@ def test_own_passport_key_confirms_only_its_scalar(analyzer, ascii_only, key):
     findings = analyzer.analyze(text=payload, language='ru', entities=['RU_PASSPORT'], score_threshold=.35)
     assert findings
     assert all(payload[r.start:r.end] == '4510-123456' for r in findings)
+
+
+@pytest.mark.parametrize('ascii_only', [None, False, True])
+@pytest.mark.parametrize('text', ['В серии 4510-123456 опечатка.', 'Сверьте серию 4510-123456.'])
+def test_passport_context_preserves_russian_case_forms(analyzer, ascii_only, text):
+    import json
+
+    payload = text if ascii_only is None else json.dumps({'text': text}, ensure_ascii=ascii_only)
+    assert _covered(analyzer, payload, '4510-123456', 'RU_PASSPORT')

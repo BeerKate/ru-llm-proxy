@@ -36,7 +36,7 @@ class RuPassportExtRecognizer(EntityRecognizer):
     """Recognize separated, labelled and glued passport series and numbers."""
 
     _CONTEXT_RE = re.compile(
-        r'(?i)(?<!\w)(?:паспорт[а-яё]*|загранпаспорт[а-яё]*|загран|серия|'
+        r'(?i)(?<!\w)(?:паспорт[а-яё]*|загранпаспорт[а-яё]*|загран|сери(?:я|и|ю|ей|й|ям|ями|ях)|'
         r'документ[а-яё]*|passport|удостоверени[а-яё]*|выдан[а-яё]*)(?!\w)'
     )
 
