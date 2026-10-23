@@ -196,6 +196,7 @@ test-recognizer-api:
 		presidio/tests/test_credential_rules.py \
 		presidio/tests/test_encoded_secrets.py \
 		presidio/tests/test_analyzer_api_thresholds.py \
+		presidio/tests/test_analyzer_server_capacity.py \
 		presidio/tests/test_base64_logistic.py \
 		presidio/tests/test_base64_logistic_api.py \
 		presidio/tests/test_base64_logistic_cases.py \
