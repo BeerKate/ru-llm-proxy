@@ -7,6 +7,8 @@ from recognizers.ru_snils import RuSnilsRecognizer
 from recognizers.ru_passport import RuPassportRecognizer
 from recognizers.ru_bank_card import RuBankCardRecognizer
 from recognizers.ru_address import RuAddressRecognizer
+from recognizers.ru_address_chain import RuAddressChainRecognizer
+from recognizers.ru_passport_ext import RuPassportExtRecognizer
 from recognizers.ru_bank_requisites import (
     RuBikRecognizer,
     RuCorrespondentAccountRecognizer,
@@ -66,4 +68,13 @@ PLAIN_RECOGNIZERS = [
     SqlCredentialRecognizer,
 ]
 
-ALL_RECOGNIZERS = [*PLAIN_RECOGNIZERS, Base64DataRecognizer, JsonStringRecognizer]
+# Additive shapes run on source text and decoded JSON values; source ranges
+# are projected back without changing the original JSON representation.
+ADDITIVE_RECOGNIZERS = [RuAddressChainRecognizer, RuPassportExtRecognizer]
+
+ALL_RECOGNIZERS = [
+    *PLAIN_RECOGNIZERS,
+    Base64DataRecognizer,
+    JsonStringRecognizer,
+    *ADDITIVE_RECOGNIZERS,
+]

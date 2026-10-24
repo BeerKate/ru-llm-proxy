@@ -9,6 +9,7 @@ from functools import lru_cache
 from typing import Iterable
 
 from presidio_analyzer import RecognizerResult
+from string_spans import StringSpans
 
 
 DETECTION_SOURCE_METADATA_KEY = "ru_llm_detection_source"
@@ -76,6 +77,25 @@ _CONTRACT_CONTEXT_RE = re.compile(
     r"contracts?|agreements?"
     r")(?![\w])"
 )
+# Identifier keys are assignment evidence, never sentence-wide context.
+_CONTRACT_KEY_RE = re.compile(
+    r"(?i)(?<![^\W_])(?:contract|agreement)s?[_\-.]?(?:id|no|nr|num|number|ref)$"
+    r"|(?<![^\W_])(?:номер_договор\w*|nomer_dogovora|"
+    r"dogovora?[_\-.]?(?:id|no|nr|num|nomer|number))$"
+)
+_CONTRACT_ASSIGNMENT_RE = re.compile(
+    r"(?<![\w.\-])(?P<key>\"(?:[^\"\\\r\n]|\\.)+\"|"
+    r"'(?:[^'\\\r\n]|\\.)+'|[A-Za-zА-Яа-яЁё_][\w.\-]*)"
+    r"[ \t]*(?P<op>[:=])(?![:=])[ \t\r\n]*"
+)
+_CONTRACT_LABEL_KEY_RE = re.compile(
+    r"(?i)(?:номер\s+(?:договора|контракта|соглашения)|"
+    r"(?:contract|agreement)\s+(?:number|no\.?|id|ref))"
+)
+_CONTRACT_SCALAR_RE = re.compile(r"[^\s,;{}\[\]():=]+")
+_CONTRACT_KEY_SEPARATOR_RE = re.compile(r"\s*:")
+_CONTRACT_HINT_RE = re.compile(r"(?i)договор|контракт|соглашени|contract|agreement|nomer_dogovora|dogovor|\\u")
+
 _CONTRACT_CANDIDATE_RE = re.compile(
     r"(?<![\w])"
     r"(?P<value>[A-Za-zА-Яа-яЁё0-9]"
@@ -93,6 +113,26 @@ _DATE_LIKE_RE = re.compile(r"\d{1,2}[./-]\d{1,2}[./-]\d{2,4}")
 _DOTTED_VERSION_RE = re.compile(r"\d{1,3}(?:\.\d{1,3}){1,3}")
 _SENTENCE_BOUNDARIES = frozenset(".!?;。！？")
 _NAME_TYPES = frozenset({"PERSON", "ORGANIZATION"})
+_JOINED_NAME_TYPES = frozenset({"PERSON", "LOCATION", "ORGANIZATION"})
+_NAME_JOIN_GAP_RE = re.compile(r"[\s«»\"'„“”‘’\-–—]{1,3}")
+_NAME_QUOTE_PAIRS = (("«", "»"), ("„", "“"), ("“", "”"))
+_ESCAPE_LETTERS = frozenset('ntrbfu"/\\')
+_ORG_GENERIC_LEAD_RE = re.compile(r"(?i)(?:организация|компания)[ \t\u00a0]+(?=[^\W\d_])")
+# Only a separator glued to the last word; "Yahoo!" and a tokenized "вести ." keep theirs.
+_ORG_TRAILING_PUNCTUATION = frozenset(".;,:")
+# A span that ends with an initial such as "И." keeps its period.
+_TRAILING_INITIAL_RE = re.compile(r"(?:^|(?<=[\s.]))[А-ЯЁA-Z]\.$")
+# One or two Cyrillic initials right after a surname: Петров И. С.
+_TRAILING_INITIALS_RE = re.compile(r"[ \t\u00a0]+[А-ЯЁ]\.(?:[ \t\u00a0]?[А-ЯЁ]\.)?(?![А-Яа-яЁё])")
+_IDENTIFIER_CHARACTERS = frozenset(
+    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_"
+)
+# camelCase, ACRONYMWord, snake_case or letters mixed with digits.
+_IDENTIFIER_SHAPE_RE = re.compile(r"[a-z][A-Z]|[A-Z]{2}[a-z]|_|[A-Za-z][0-9]|[0-9][A-Za-z]")
+# Generic model predictions that never correct another detection's boundaries.
+_STATISTICAL_RECOGNIZERS = frozenset({"SpacyRecognizer"})
+# Rules that only add coverage; their open parts survive any overlap.
+_ADDITIVE_RECOGNIZERS = frozenset({"RuAddressChainRecognizer", "RuPassportExtRecognizer"})
 _LEGAL_FORM_RE = re.compile(r"(?:ООО|АО|ПАО|ОАО|ЗАО)", re.IGNORECASE)
 _NAME_WORDS_RE = re.compile(r"[А-Яа-яЁё]+(?:[- \t\u00a0][А-Яа-яЁё]+){1,2}")
 _PERSON_FIELD_RE = re.compile(r"(?i)(?<!\w)(?:фио|ф\.и\.о\.)\s*[:=]\s*$")
@@ -247,40 +287,153 @@ def detection_source(result: RecognizerResult) -> str:
     return SOURCE_STRUCTURAL
 
 
-def contract_context_evidence(text: str) -> tuple[tuple[int, int], ...]:
-    """Return contract-number candidates backed by nearby contract context."""
-    evidence = []
+def _contract_candidates(text):
+    """The existing number policy, independent of how its context is confirmed."""
     for match in _CONTRACT_CANDIDATE_RE.finditer(text):
         value = match.group("value")
         if not any(character.isdigit() for character in value):
             continue
-        normalized_value = value.replace("\u00ad", "")
+        normalized = value.replace("\u00ad", "")
         if (
-            _DATE_LIKE_RE.fullmatch(normalized_value)
-            or _DOTTED_VERSION_RE.fullmatch(normalized_value)
-            or (normalized_value.isdigit() and len(normalized_value) < 6)
+            _DATE_LIKE_RE.fullmatch(normalized)
+            or _DOTTED_VERSION_RE.fullmatch(normalized)
+            or (normalized.isdigit() and len(normalized) < 6)
         ):
             continue
-
         start, end = match.span("value")
         while end > start and text[end - 1] in ".-/\u00ad":
             end -= 1
-        if end - start < 3:
-            continue
+        if end - start >= 3:
+            yield start, end
 
-        context_start = max(0, start - 96)
+
+def _contract_key(key):
+    return bool(_CONTRACT_KEY_RE.search(key) or _CONTRACT_CONTEXT_RE.fullmatch(key)
+                or _CONTRACT_LABEL_KEY_RE.fullmatch(key))
+
+
+def _literal_view(text, literal):
+    """Reuse validated JSON escape projection; leave other language literals raw."""
+    import json
+    from recognizers.json_strings import decoded_string_offsets
+
+    prefix = text[max(0, literal.start - 3):literal.start]
+    raw = re.search(r"(?i)(?<!\w)(?:r|br|rb|fr|rf)$", prefix) is not None
+    if not raw and text[literal.start] == '"':
+        try:
+            json.loads(text[literal.start:literal.end])
+        except (ValueError, RecursionError):
+            pass
+        else:
+            return decoded_string_offsets(text, literal.start, literal.end)
+    return (text[literal.content_start:literal.content_end],
+            range(literal.content_start, literal.content_end + 1))
+
+
+def _contract_bindings(text, strings):
+    """Bind each assignment to one scalar, never to a container or next field."""
+    import ast
+
+    bindings = []
+    keys = []
+    for match in _CONTRACT_ASSIGNMENT_RE.finditer(text):
+        left, right = match.span("key")
+        owner = strings.at(left)
+        if owner is not None and (owner.start, owner.end) != (left, right):
+            # Analyze textual assignments inside a source string in its own view.
+            continue
+        key = match.group("key")
+        quoted = key[0] in "\"'"
+        if quoted:
+            try:
+                key = ast.literal_eval(key)
+            except (ValueError, SyntaxError):
+                continue
+        before = left - 1
+        while before >= 0 and text[before] in " \t":
+            before -= 1
+        structured = (quoted or match.group("op") == "=" or before < 0
+                      or text[before] in "\r\n{[(,;")
+        confirmed = _contract_key(key)
+        keys.append((left, right))
+        start = match.end()
+        literal = strings.at(start)
+        if literal is not None and literal.start == start:
+            decoded, offsets = _literal_view(text, literal)
+            bindings.append((start, literal.end, confirmed, structured, decoded, offsets))
+        else:
+            scalar = _CONTRACT_SCALAR_RE.match(text, start)
+            if scalar:
+                end = scalar.end()
+                bindings.append((start, end, confirmed, structured,
+                                 text[start:end], range(start, end + 1)))
+                if (not quoted and match.group("op") == ":"
+                        and _CONTRACT_CONTEXT_RE.fullmatch(key)
+                        and next(_contract_candidates(text[start:end]), None) is not None):
+                    # A prose label such as "Договоры: AA-... и BB-..." still
+                    # introduces a list. Other assignment values remain scoped
+                    # independently; null/containers never introduce prose.
+                    keys.pop()
+    return bindings, keys
+
+
+def _plain_contract_evidence(text, strings):
+    bindings, keys = _contract_bindings(text, strings)
+    evidence = []
+    for _, _, confirmed, _, decoded, offsets in bindings:
+        if confirmed:
+            evidence.extend((offsets[start], offsets[end])
+                            for start, end in _contract_candidates(decoded))
+
+    key_starts = [start for start, _ in keys]
+    binding_starts = [start for start, *_ in bindings]
+    for start, end in _contract_candidates(text):
+        key_index = bisect_right(key_starts, start) - 1
+        if key_index >= 0 and start < keys[key_index][1]:
+            continue
+        literal = strings.at(start)
+        binding_index = bisect_right(binding_starts, start) - 1
+        if binding_index >= 0:
+            left, right, _, structured, _, _ = bindings[binding_index]
+            if left <= start < right and structured and literal is None:
+                continue
+        context_start = max(0, start - 96, literal.content_start if literal else 0)
         for index in range(start - 1, context_start - 1, -1):
             if _is_sentence_boundary(text, index):
                 context_start = index + 1
                 break
         context = text[context_start:start]
-        has_contract_context = _CONTRACT_CONTEXT_RE.search(context) is not None
-        has_disqualifier = _CONTRACT_DISQUALIFIER_RE.search(context) is not None
-        has_explicit_number = _EXPLICIT_CONTRACT_NUMBER_RE.search(context) is not None
-        if has_contract_context and (not has_disqualifier or has_explicit_number):
+        has_context = False
+        for match in _CONTRACT_CONTEXT_RE.finditer(text, context_start, start):
+            index = bisect_right(key_starts, match.start()) - 1
+            if index >= 0 and match.start() < keys[index][1]:
+                continue
+            if strings.at(match.start()) is literal:
+                has_context = True
+                break
+        disqualified = _CONTRACT_DISQUALIFIER_RE.search(context) is not None
+        explicit = _EXPLICIT_CONTRACT_NUMBER_RE.search(context) is not None
+        if has_context and (not disqualified or explicit):
             evidence.append((start, end))
+    return evidence
 
-    return tuple(dict.fromkeys(evidence))
+
+def contract_context_evidence(
+    text: str, *, _strings: StringSpans | None = None,
+) -> tuple[tuple[int, int], ...]:
+    """Separate assignment-owned values from natural-language contract context."""
+    if _CONTRACT_HINT_RE.search(text) is None:
+        return ()
+    strings = _strings if _strings is not None else StringSpans(text)
+    evidence = _plain_contract_evidence(text, strings)
+    for literal in strings.spans:
+        # Keys are not free-text context for a different value.
+        if _CONTRACT_KEY_SEPARATOR_RE.match(text, literal.end):
+            continue
+        decoded, offsets = _literal_view(text, literal)
+        for start, end in _plain_contract_evidence(decoded, StringSpans(decoded)):
+            evidence.append((offsets[start], offsets[end]))
+    return tuple(sorted(set(evidence)))
 
 
 def _is_sentence_boundary(text: str, index: int) -> bool:
@@ -305,9 +458,40 @@ def merge_results(
         requested_entities = tuple(requested_entities)
     decisions = []
     valid_results = []
-    contract_evidence = contract_context_evidence(text)
+    strings = StringSpans(text)
+    contract_evidence = contract_context_evidence(text, _strings=strings)
     reference_spans = []
-    results = list(results)
+    normalized = []
+    for result in results:
+        if not _valid_span(result, len(text)):
+            normalized.append(result)  # Preserve the existing invalid-span decision.
+            continue
+        literal = strings.at(result.start)
+        # Existing specialized rules may deliberately cover a concatenated key
+        # across several code literals. Keep that established native contract;
+        # Statistical/additive findings crossing syntax widen to every touched
+        # value instead of losing their tail or masking a service key alone.
+        bound_to_values = (
+            detection_source(result) == SOURCE_NER
+            or _recognizer_name(result) in _ADDITIVE_RECOGNIZERS
+        )
+        ranges = [(result.start, result.end)]
+        if bound_to_values:
+            ranges = strings.mask_ranges(
+                result.start, result.end, name=result.entity_type in _JOINED_NAME_TYPES,
+            )
+        elif literal is None or result.end <= literal.end:
+            bounds = strings.align(
+                result.start, result.end,
+                name=result.entity_type in _JOINED_NAME_TYPES,
+            )
+            ranges = [bounds] if bounds else []
+        for bounds in ranges:
+            normalized.append(
+                result if bounds == (result.start, result.end)
+                else _copy_name(result, start=bounds[0], end=bounds[1])
+            )
+    results = normalized
     # The experimental cascade adds coverage; it must never compete with native
     # credential or NER findings for ownership of their existing ranges.
     logistic_results = [r for r in results if _is_logistic_base64(r)]
@@ -317,6 +501,7 @@ def merge_results(
         from recognizers.credential_rules import credential_reference_spans
         reference_spans = credential_reference_spans(text)
 
+    code_identifiers = None
     for result in results:
         source = detection_source(result)
         if not _valid_span(result, len(text)):
@@ -324,6 +509,20 @@ def merge_results(
                 MergeDecision("invalid_span", SOURCE_NONE, source)
             )
             continue
+        if result.entity_type in _JOINED_NAME_TYPES:
+            trimmed = result if strings.at(result.start) else _skip_escape_letter(text, result)
+            if trimmed is None:
+                decisions.append(MergeDecision("name_escape_letter_dropped", SOURCE_NONE, source))
+                continue
+            result = trimmed
+        if result.entity_type == "ORGANIZATION" and source == SOURCE_NER:
+            trimmed = _trim_model_organization(text, result)
+            if trimmed is None:
+                decisions.append(MergeDecision("organization_boundary_empty", SOURCE_NONE, source))
+                continue
+            if trimmed is not result:
+                decisions.append(MergeDecision("organization_boundary_trimmed", source, source))
+            result = trimmed
         if (
             source == SOURCE_NER
             and result.entity_type == "LOGIN"
@@ -360,6 +559,23 @@ def merge_results(
                 )
             )
             continue
+        identifier = (
+            _cut_code_identifier(text, result.start, result.end)
+            if source == SOURCE_NER and result.entity_type == "ORGANIZATION"
+            else None
+        )
+        if identifier is not None and not any(
+            _spans_overlap(other.start, other.end, *identifier)
+            for other in results
+            if other.entity_type != "ORGANIZATION" or detection_source(other) != SOURCE_NER
+        ):
+            if code_identifiers is None:
+                code_identifiers = _code_identifier_spans(text, strings)
+            if identifier in code_identifiers:
+                decisions.append(
+                    MergeDecision("ner_identifier_fragment_suppressed", SOURCE_NONE, SOURCE_NER)
+                )
+                continue
         if source == SOURCE_NER and result.entity_type == "CONTRACT_NUMBER":
             confirmed = any(
                 _spans_overlap(result.start, result.end, start, end)
@@ -456,6 +672,7 @@ def merge_results(
     valid_results = retained
     ordered = sorted(valid_results, key=_priority_key)
     kept: list[RecognizerResult] = []
+    overlapped: list[RecognizerResult] = []
     for candidate in ordered:
         conflict = next(
             (
@@ -481,6 +698,18 @@ def merge_results(
                 detection_source(candidate),
             )
         )
+        overlapped.append(candidate)
+
+    for fragment in _uncovered_fragments(text, kept, overlapped):
+        kept.append(fragment)
+        decisions.append(
+            MergeDecision("overlap_fragment_kept", detection_source(fragment), SOURCE_NONE)
+        )
+    kept, joined = _join_name_fragments(text, kept, strings)
+    decisions.extend(
+        MergeDecision("name_fragments_joined", detection_source(r), detection_source(r))
+        for r in joined
+    )
 
     kept.sort(key=lambda result: (result.start, result.end, result.entity_type))
     if logistic_results:
@@ -490,6 +719,351 @@ def merge_results(
         )
         decisions.extend(added_decisions)
     return MergeOutcome(tuple(kept), tuple(decisions))
+
+
+def _trim_model_organization(text: str, result: RecognizerResult) -> RecognizerResult | None:
+    """Drop a glued closing separator and a leading generic noun from a model organization.
+
+    ``ООО Вектор.`` and ``Организация Northwind Research Ltd`` name the same
+    companies as ``ООО Вектор`` and ``Northwind Research Ltd``. Only ``. ; , :``
+    glued to the last word are dropped, and a trailing initial such as ``И.``
+    keeps its period. Instruction tails after a sentence are handled by the
+    name refinement below.
+    """
+    start, end = result.start, result.end
+    lead = _ORG_GENERIC_LEAD_RE.match(text, start, end)
+    if lead is not None:
+        start = lead.end()
+    while (
+        end - start > 1
+        and text[end - 1] in _ORG_TRAILING_PUNCTUATION
+        and not text[end - 2].isspace()
+        and _TRAILING_INITIAL_RE.search(text, start, end) is None
+    ):
+        end -= 1
+    if (start, end) == (result.start, result.end):
+        return result
+    if not any(character.isalnum() for character in text[start:end]):
+        return None
+    return _copy_name(result, start=start, end=end)
+
+
+def _skip_escape_letter(text: str, result: RecognizerResult) -> RecognizerResult | None:
+    """Move a name start off the letter of a backslash escape such as ``\\nСервис``.
+
+    Masking ``nСервис`` would leave a lone backslash and break the JSON or
+    code string; a name that was only that letter is dropped.
+    """
+    start = result.start
+    backslashes = 0
+    cursor = start - 1
+    while cursor >= 0 and text[cursor] == "\\":
+        backslashes += 1
+        cursor -= 1
+    if backslashes % 2 and text[start] in _ESCAPE_LETTERS:
+        start += 1
+        if not any(character.isalnum() for character in text[start : result.end]):
+            return None
+        return _copy_name(result, start=start)
+    return result
+
+
+def _join_name_fragments(
+    text: str,
+    kept: list[RecognizerResult],
+    strings: StringSpans,
+) -> tuple[list[RecognizerResult], list[RecognizerResult]]:
+    """Join same-type model names split by spaces, quotes or dashes; close edge quotes.
+
+    ``ООО`` + ``«Лаборатория Север»`` or ``Москва - Гавана`` are one value; a
+    gap of punctuation between two masks would otherwise stay visible. A
+    model name that leaves a quote pair half-open takes the neighbouring quote,
+    and a model surname takes the initials right after it (``Петров И. С.``),
+    when no other result owns those characters. Deterministic results keep
+    their boundaries.
+    """
+    ordered = sorted(kept, key=lambda r: (r.start, r.end))
+    joined: list[RecognizerResult] = []
+    out: list[RecognizerResult] = []
+    for result in ordered:
+        last = out[-1] if out else None
+        if (
+            last is not None
+            and result.entity_type == last.entity_type
+            and result.entity_type in _JOINED_NAME_TYPES
+            and _is_statistical(last)
+            and _is_statistical(result)
+            and last.end <= result.start
+            and strings.same_value(last.start, result.start)
+            and _NAME_JOIN_GAP_RE.fullmatch(text[last.end : result.start])
+        ):
+            out[-1] = _copy_name(last, end=result.end, score=max(last.score, result.score))
+            joined.append(out[-1])
+        else:
+            out.append(result)
+    for index, result in enumerate(out):
+        if result.entity_type not in _JOINED_NAME_TYPES or not _is_statistical(result):
+            continue
+        start, end = _balance_name_quotes(text, result.start, result.end)
+        if result.entity_type == "PERSON":
+            initials = _TRAILING_INITIALS_RE.match(text, end)
+            if initials is not None:
+                end = initials.end()
+        bounds = strings.align(start, end)
+        if bounds is None:
+            continue
+        start, end = bounds
+        previous_end = out[index - 1].end if index > 0 else 0
+        next_start = out[index + 1].start if index + 1 < len(out) else len(text)
+        if (start, end) != (result.start, result.end) and start >= previous_end and end <= next_start:
+            out[index] = _copy_name(result, start=start, end=end)
+    return out, joined
+
+
+def _balance_name_quotes(text: str, start: int, end: int) -> tuple[int, int]:
+    value = text[start:end]
+    for opening, closing in _NAME_QUOTE_PAIRS:
+        if value.count(opening) > value.count(closing) and end < len(text) and text[end] == closing:
+            end += 1
+        elif value.count(closing) > value.count(opening) and start > 0 and text[start - 1] == opening:
+            start -= 1
+    if value.count('"') % 2 == 1:
+        if end < len(text) and text[end] == '"':
+            end += 1
+        elif start > 0 and text[start - 1] == '"':
+            start -= 1
+    return start, end
+
+
+def _cut_code_identifier(text: str, start: int, end: int) -> tuple[int, int] | None:
+    """Return a containing Latin identifier, without asserting that it is code.
+
+    Shape only identifies a possible cut. The caller separately requires a
+    proven code-symbol span and keeps any run touched by another detection.
+    Whole words and Cyrillic text are never suppressed by this rule.
+    """
+    for inside, outside in ((start, start - 1), (end - 1, end)):
+        if not 0 <= outside < len(text) or not start <= inside < end:
+            continue
+        if text[inside] not in _IDENTIFIER_CHARACTERS or text[outside] not in _IDENTIFIER_CHARACTERS:
+            continue
+        run_start, run_end = min(inside, outside), max(inside, outside) + 1
+        while run_start > 0 and text[run_start - 1] in _IDENTIFIER_CHARACTERS:
+            run_start -= 1
+        while run_end < len(text) and text[run_end] in _IDENTIFIER_CHARACTERS:
+            run_end += 1
+        if _IDENTIFIER_SHAPE_RE.search(text[run_start:run_end]):
+            return run_start, run_end
+    return None
+
+
+def _code_identifier_spans(text: str, strings: StringSpans) -> set[tuple[int, int]]:
+    """Prove local symbol roles in valid Python and explicit Python fences.
+
+    A string value/comment, bare word, or an unrelated code block is not proof.
+    Parsing never evaluates source; invalid/unknown syntax conservatively keeps
+    the detection. Only targets, callable names, imports, declarations and
+    literal __all__ export entries are eligible, not arbitrary data expressions.
+    """
+    import ast
+    import tokenize
+
+    parts = [(0, text)]
+    for match in re.finditer(
+        r"(?m)^[ \t]*```(?:python|py)[ \t]*\r?\n(?P<code>[\s\S]*?)^[ \t]*```[ \t]*\r?$",
+        text,
+    ):
+        if strings.at(match.start()) is None:
+            parts.append((match.start("code"), match.group("code")))
+    spans = set()
+    for base, source in parts:
+        try:
+            tree = ast.parse(source)
+        except (SyntaxError, ValueError, RecursionError):
+            continue
+        # Python source lines use CR/LF, not every Unicode separator recognized
+        # by str.splitlines() (e.g. a form feed inside a string literal).
+        lines = re.findall(r"[^\r\n]*(?:\r\n|\r|\n|$)", source)
+        starts = [0]
+        for line in lines:
+            starts.append(starts[-1] + len(line))
+
+        byte_columns = {}
+
+        def offset(row, column, *, byte_column=False):
+            line = lines[row - 1]
+            if byte_column and not line.isascii():
+                if row not in byte_columns:
+                    mapping = {0: 0}
+                    byte_index = 0
+                    for char_index, char in enumerate(line, 1):
+                        byte_index += len(char.encode("utf-8"))
+                        mapping[byte_index] = char_index
+                    byte_columns[row] = mapping
+                column = byte_columns[row][column]
+            return starts[row - 1] + column
+
+        def bounds(node):
+            return (offset(node.lineno, node.col_offset, byte_column=True),
+                    offset(node.end_lineno, node.end_col_offset, byte_column=True))
+
+        roles = []
+        proved = set()
+        attribute_ends = set()
+
+        def callable_roles(node):
+            while isinstance(node, ast.Attribute):
+                # Do not include arguments of factory(secret).method().
+                attribute_ends.add(bounds(node)[1])
+                node = node.value
+            if isinstance(node, ast.Name):
+                roles.append(bounds(node))
+
+        nodes = list(ast.walk(tree))
+        bare_labels = {
+            id(node.target) for node in nodes
+            if isinstance(node, ast.AnnAssign) and node.value is None
+        }
+        for node in nodes:
+            if (isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store)
+                    and id(node) not in bare_labels):
+                roles.append(bounds(node))
+            elif isinstance(node, ast.Call):
+                callable_roles(node.func)
+            elif isinstance(node, (ast.Import, ast.ImportFrom)):
+                roles.append(bounds(node))
+            elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                start, _ = bounds(node)
+                header = re.compile(
+                    r"(?:async\s+)?(?:def|class)\s+(?P<name>" + re.escape(node.name) + r")\b"
+                ).match(source, start)
+                if header:
+                    roles.append(header.span("name"))
+            if isinstance(node, (ast.Assign, ast.AugAssign)):
+                targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+                if (any(isinstance(t, ast.Name) and t.id == "__all__" for t in targets)
+                        and isinstance(node.value, (ast.List, ast.Tuple, ast.Set))):
+                    for value in node.value.elts:
+                        if not (isinstance(value, ast.Constant) and isinstance(value.value, str)
+                                and value.value.isascii() and value.value.isidentifier()):
+                            continue
+                        left, right = bounds(value)
+                        index = bisect_left(strings.starts, base + left)
+                        if index < len(strings.spans):
+                            literal = strings.spans[index]
+                            if (literal.end <= base + right
+                                    and text[literal.content_start:literal.content_end] == value.value):
+                                proved.add((literal.content_start, literal.content_end))
+        roles.sort()
+        role_starts = [start for start, _ in roles]
+        role_ends = []
+        for _, end in roles:
+            role_ends.append(max(end, role_ends[-1] if role_ends else 0))
+        try:
+            reader = iter(lines)
+            for token in tokenize.generate_tokens(lambda: next(reader, "")):
+                if token.type != tokenize.NAME:
+                    continue
+                start = offset(*token.start)
+                end = offset(*token.end)
+                index = bisect_right(role_starts, start) - 1
+                if end in attribute_ends or (index >= 0 and end <= role_ends[index]):
+                    proved.add((base + start, base + end))
+        except (tokenize.TokenError, IndentationError):
+            # ast.parse already validated syntax; keep any uncertain names.
+            continue
+        spans.update(proved)
+    return spans
+
+
+def _recognizer_name(result: RecognizerResult) -> str:
+    metadata = result.recognition_metadata or {}
+    return str(metadata.get("projected_recognizer_name", metadata.get(RecognizerResult.RECOGNIZER_NAME_KEY, "")))
+
+
+def _is_statistical(result: RecognizerResult) -> bool:
+    return (
+        detection_source(result) == SOURCE_NER
+        or _recognizer_name(result) in _STATISTICAL_RECOGNIZERS
+    )
+
+
+def _fragment_mode(
+    result: RecognizerResult,
+    kept: list[RecognizerResult],
+) -> str | None:
+    """Which characters of an overlapped result no winner covers may stay masked.
+
+    Additive address/passport rules complete what other detections leave
+    open. A model span keeps its whole remainder when every overlapping winner
+    is statistical too. Against a deterministic winner, which defines the value
+    boundaries, it keeps only a token glued to the right of a winner: a value
+    cut short at ``&`` continues there, while labels such as ``token=``,
+    ``Bearer`` or ``no.`` precede the value and stay visible.
+    """
+    if _recognizer_name(result) in _ADDITIVE_RECOGNIZERS:
+        return "remainder"
+    if detection_source(result) != SOURCE_NER:
+        return None
+    if all(
+        _is_statistical(winner)
+        for winner in kept
+        if _spans_overlap(result.start, result.end, winner.start, winner.end)
+    ):
+        return "remainder"
+    return "glued_right"
+
+
+def _uncovered_fragments(
+    text: str,
+    kept: list[RecognizerResult],
+    overlapped: list[RecognizerResult],
+) -> list[RecognizerResult]:
+    """Return the eligible parts of overlapped results that no winner covers.
+
+    Overlap resolution drops a whole lower-priority result even when it is
+    longer than the winner, so its other characters would reach the provider.
+    Every overlapped result already passed the source filters above; each
+    uncovered run keeps its type, score and metadata, trimmed of edge spaces.
+    """
+    modes = {id(r): _fragment_mode(r, kept) for r in overlapped}
+    overlapped = [r for r in overlapped if modes[id(r)] is not None]
+    if not overlapped:
+        return []
+    covered = bytearray(len(text))
+    for result in kept:
+        covered[result.start : result.end] = b"\x01" * (result.end - result.start)
+    winner_ends = {result.end for result in kept}
+    fragments = []
+    for result in sorted(overlapped, key=lambda r: (r.start, r.start - r.end)):
+        index = result.start
+        while index < result.end:
+            if covered[index]:
+                index += 1
+                continue
+            run_end = index
+            while run_end < result.end and not covered[run_end]:
+                run_end += 1
+            start, end = index, run_end
+            if modes[id(result)] == "glued_right":
+                if start not in winner_ends or text[start].isspace():
+                    index = run_end
+                    continue
+                end = start
+                while end < run_end and not text[end].isspace():
+                    end += 1
+            while start < end and text[start].isspace():
+                start += 1
+            while end > start and text[end - 1].isspace():
+                end -= 1
+            if start < end:
+                fragments.append(_copy_name(result, start=start, end=end))
+                # Trimming or glued_right may shorten the uncovered run. Only
+                # the emitted span is covered; later eligible findings still
+                # need to see its unmasked remainder.
+                covered[start:end] = b"\x01" * (end - start)
+            index = run_end
+    return fragments
 
 
 def _is_logistic_base64(result: RecognizerResult) -> bool:
@@ -667,7 +1241,11 @@ def _refine_names(
                     before = text[result.start : boundary].rstrip()
                     if not before.endswith("."):
                         continue
-                    tail = text[boundary : result.end].strip()
+                    # A subword model may stop inside the word (Верн|и).
+                    tail_end = result.end
+                    while tail_end < len(text) and text[tail_end].isalpha():
+                        tail_end += 1
+                    tail = text[boundary:tail_end].strip()
                     if not _is_unambiguous_imperative(tail):
                         continue
                     end = result.start + len(before) - 1
@@ -740,18 +1318,15 @@ def _refine_explicit_name_values(
     ):
         return results, decisions
     # Only a separate field header may be discarded, never its value or a
-    # similarly named organization in prose. BIO may include the separator.
-    label_spans = {
-        match.start("label"): (match.end("label"), match.end())
-        for match in _PERSON_LABEL_RE.finditer(text)
-    }
+    # similarly named organization in prose. BIO may include the separator,
+    # and a subword model may mark only pieces of the label (Ф. or .).
+    headers = [(match.start("label"), match.end()) for match in _PERSON_LABEL_RE.finditer(text)]
     retained = []
     for result in results:
         if (
             detection_source(result) == SOURCE_NER
             and result.entity_type in _NAME_TYPES
-            and (bounds := label_spans.get(result.start)) is not None
-            and bounds[0] <= result.end <= bounds[1]
+            and any(start <= result.start and result.end <= end for start, end in headers)
         ):
             decisions.append(MergeDecision("name_field_label", SOURCE_NONE, SOURCE_NER))
         else:

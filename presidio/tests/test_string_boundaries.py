@@ -1,0 +1,493 @@
+"""Synthetic regressions for source-preserving masks in JSON and quoted code."""
+import ast
+import json
+import sys
+from pathlib import Path
+
+import pytest
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from presidio_analyzer import RecognizerResult
+from recognizers import ALL_RECOGNIZERS
+from result_merging import (
+    merge_results, DETECTION_SOURCE_METADATA_KEY, SOURCE_NER, SOURCE_NATIVE_CREDENTIAL,
+)
+
+
+@pytest.fixture(scope='module')
+def recognizers():
+    return [cls() for cls in ALL_RECOGNIZERS]
+
+
+def detections(text, recognizers, entities=None):
+    return [r for recognizer in recognizers
+            for r in recognizer.analyze(text, entities or recognizer.supported_entities, None)]
+
+
+def finding(kind, start, end, source=SOURCE_NER):
+    return RecognizerResult(kind, start, end, .9, recognition_metadata={
+        DETECTION_SOURCE_METADATA_KEY: source,
+        RecognizerResult.RECOGNIZER_NAME_KEY: 'synthetic-boundary-probe',
+    })
+
+
+def mask_and_restore(text, results):
+    spans = merge_results(text, results, score_threshold=.35).results
+    assert all(a.end <= b.start for a, b in zip(spans, spans[1:]))
+    masked = text
+    saved = {}
+    for i, result in reversed(list(enumerate(spans))):
+        token = f'<MASK_{i}>'
+        saved[token] = text[result.start:result.end]
+        masked = masked[:result.start] + token + masked[result.end:]
+    restored = masked
+    for token, value in saved.items():
+        restored = restored.replace(token, value)
+    assert restored.encode('utf-8') == text.encode('utf-8')
+    return masked, spans
+
+
+@pytest.mark.parametrize('value', ['"', '\\', '$$', '-$', '\\"', 'a"b', 'a\\b', '\n', '\t', '😀"\\', 'a', 'ab', '0'])
+@pytest.mark.parametrize('ascii_only', [False, True])
+def test_json_password_escapes_preserve_structure_and_restore(value, ascii_only, recognizers):
+    text = json.dumps({'password': value, 'next': 'ordinary'}, ensure_ascii=ascii_only)
+    masked, spans = mask_and_restore(text, detections(text, recognizers))
+    document = json.loads(masked)
+    assert document['next'] == 'ordinary'
+    assert document['password'] != value
+    assert any(r.entity_type == 'PASSWORD' for r in spans)
+    raw_start = text.index('\"', text.index(':')) + 1
+    raw_end = text.index(',') - 1
+    assert all(any(r.start <= i < r.end for r in spans) for i in range(raw_start, raw_end))
+
+
+@pytest.mark.parametrize('ascii_only', [False, True])
+def test_json_address_with_internal_quotes(ascii_only, recognizers):
+    value = 'ул. Ленина, д. 5, кв. "12"'
+    text = json.dumps({'address': value, 'next': 7}, ensure_ascii=ascii_only)
+    masked, spans = mask_and_restore(text, detections(text, recognizers))
+    assert json.loads(masked)['next'] == 7
+    assert json.loads(masked)['address'].startswith('<MASK_')
+    assert '12' not in json.loads(masked)['address']
+    assert all(r.entity_type == 'RU_ADDRESS' for r in spans)
+
+
+def test_controlled_ner_tail_stops_at_json_value():
+    text = '{"password":"Synthetic42","x":1}'
+    start = text.index('Synthetic42'); end = start + len('Synthetic42')
+    masked, spans = mask_and_restore(text, [
+        finding('PASSWORD', start, end, SOURCE_NATIVE_CREDENTIAL),
+        finding('PASSWORD', start, end + 2),
+    ])
+    assert json.loads(masked) == {'password': '<MASK_0>', 'x': 1}
+    assert spans[-1].end == end
+
+
+def test_controlled_name_balance_keeps_outer_quote():
+    text = json.dumps({'text': 'ООО "Вектор'}, ensure_ascii=False)
+    start = text.index('ООО'); end = len(text) - 2
+    masked, _ = mask_and_restore(text, [finding('ORGANIZATION', start, end)])
+    assert json.loads(masked) == {'text': '<MASK_0>'}
+
+
+@pytest.mark.parametrize('prefix', [
+    "Here's the payload: ", "don't change this: ", "O'Reilly's example: ",
+    'Незакрытая кавычка " перед данными: ',
+    'Example: "unfinished introduction ',
+    "Example: 'unfinished introduction ",
+    'Example: "unfinished {broken} introduction ',
+])
+@pytest.mark.parametrize('array', [False, True])
+@pytest.mark.parametrize('ascii_only', [False, True])
+def test_prose_quotes_cannot_hide_embedded_json_boundaries(prefix, array, ascii_only):
+    document = {'password': 'Ж42\\"', 'next': 'ordinary'}
+    raw = json.dumps([document] if array else document, ensure_ascii=ascii_only)
+    text = prefix + raw
+    value = json.dumps(document['password'], ensure_ascii=ascii_only)[1:-1]
+    start = text.index(value); end = start + len(value)
+    masked, _ = mask_and_restore(text, [
+        finding('PASSWORD', start, end, SOURCE_NATIVE_CREDENTIAL),
+        finding('PASSWORD', start, end + 2),
+    ])
+    decoded = json.loads(masked[len(prefix):])
+    decoded = decoded[0] if array else decoded
+    assert decoded == {'password': '<MASK_0>', 'next': 'ordinary'}
+    assert masked[:len(prefix)] == prefix
+
+
+@pytest.mark.parametrize('text', [
+    'parts = ["{", ": 1}"]',
+    'parts = ["[", "]"]',
+    'def sample():\n    return "{", ": 1}"',
+    'value = "{" if ": 1}" else "fallback"',
+    'def sample():\n    return \'{"password":"Synthetic42","x":1}\'',
+    'value = """{"password":"Synthetic42","x":1}"""',
+    'value = r\'{"password":"Synthetic42","x":1}\'',
+    '# Here\'s a comment\nvalue = \'{"password":"Synthetic42","x":1}\'',
+])
+def test_recovery_never_reinterprets_complete_python_literals(text):
+    from string_spans import StringSpans
+
+    ast.parse(text)
+    strings = StringSpans(text)
+    for span in strings.spans:
+        # Every recorded opening must be an actual Python literal opening,
+        # never an inner quote invented by recovery from JSON-looking data.
+        tree = ast.parse(text)
+        literals = [node for node in ast.walk(tree)
+                    if isinstance(node, ast.Constant) and isinstance(node.value, str)]
+        lines = text.splitlines(keepends=True)
+        positions = []
+        for node in literals:
+            positions.append(sum(len(line) for line in lines[:node.lineno-1])
+                             + len(lines[node.lineno-1].encode()[:node.col_offset].decode()))
+        assert span.start in positions or text[max(0,span.start-1):span.start].lower() == 'r'
+
+
+@pytest.mark.parametrize('prefix', [
+    'Payload: ', "Here's the payload: ", 'Example: "unfinished ',
+    "Example: 'unfinished ",
+])
+@pytest.mark.parametrize('parts', [['{', ': 1}'], ['[', ']'], ['{', ': {"x":1}}']])
+def test_recovery_keeps_json_looking_fragments_inside_actual_json_values(prefix, parts):
+    from string_spans import StringSpans
+
+    document = json.dumps({'parts': parts, 'password': 'Synthetic42', 'next': 1})
+    text = prefix + document
+    strings = StringSpans(text)
+    cursor = len(prefix)
+    for value in parts:
+        raw = json.dumps(value)
+        start = text.index(raw, cursor)
+        span = strings.at(start)
+        assert span is not None
+        assert (span.start, span.end) == (start, start + len(raw))
+        cursor = span.end
+    start = text.index('Synthetic42'); end = start + len('Synthetic42')
+    masked, _ = mask_and_restore(text, [finding('PASSWORD', start, end + 2)])
+    assert json.loads(masked[len(prefix):])['parts'] == parts
+
+
+@pytest.mark.parametrize('policy', ['content', 'logistic'])
+def test_api_prose_json_recovery_with_controlled_wide_ner(monkeypatch, policy):
+    from fastapi.testclient import TestClient
+    from presidio import analyzer_server
+
+    monkeypatch.setenv('PRESIDIO_ANALYZER_BASE64_POLICY', policy)
+    monkeypatch.setattr(analyzer_server.ner_recognizer, 'require_ready', lambda: None)
+
+    def wide_ner(text, **kwargs):
+        start = text.index('Synthetic42')
+        return [finding('PASSWORD', start, start + len('Synthetic42') + 2)]
+
+    monkeypatch.setattr(analyzer_server.ner_recognizer, 'analyze', wide_ner)
+    api = TestClient(analyzer_server.app)
+    for prefix in ["Here's the payload: ", 'Example: "unfinished ']:
+        document = '{"password":"Synthetic42","next":"ordinary"}'
+        text = prefix + document
+        response = api.post('/api/v1/analyze', json={
+            'text': text, 'entities': ['PASSWORD'], 'score_threshold': .35,
+        })
+        assert response.status_code == 200
+        masked = text
+        saved = {}
+        for i, result in reversed(list(enumerate(response.json()['entities']))):
+            token = f'<MASK_{i}>'
+            saved[token] = text[result['start']:result['end']]
+            masked = masked[:result['start']] + token + masked[result['end']:]
+        assert json.loads(masked[len(prefix):]) == {'password': '<MASK_0>', 'next': 'ordinary'}
+        for token, value in saved.items():
+            masked = masked.replace(token, value)
+        assert masked.encode() == text.encode()
+
+
+@pytest.mark.parametrize('constant', ['NaN', 'Infinity'])
+def test_recovery_does_not_validate_non_json_numeric_constants(constant):
+    from string_spans import StringSpans
+
+    text = 'Intro " unfinished {"value":' + constant + '}'
+    assert StringSpans(text).at(text.index('value')) is None
+
+
+@pytest.mark.parametrize('escape', [r'\"', r'\\', r'\u041c', r'\ud83d\ude00'])
+def test_every_partial_escape_span_is_indivisible(escape):
+    text = '{"value":"' + escape + '","x":1}'
+    start = text.index(escape)
+    for left in range(len(escape)):
+        for right in range(left + 1, len(escape) + 1):
+            masked, _ = mask_and_restore(text, [finding('PASSWORD', start + left, start + right)])
+            assert json.loads(masked)['x'] == 1
+            assert json.loads(masked)['value'] == '<MASK_0>'
+
+
+def test_name_after_literal_backslash_n_keeps_letter_n():
+    text = json.dumps({'text': r'\nСервис Плюс'}, ensure_ascii=False)
+    start = text.index('nСервис')
+    _, spans = mask_and_restore(text, [finding('ORGANIZATION', start, len(text)-2)])
+    assert spans[0].start == start
+
+
+@pytest.mark.parametrize('prefix', ['', 'Запрос:\n', '```json\n'])
+def test_json_in_text_and_code_fence_keeps_boundaries(prefix):
+    text = prefix + '{"password":"Synthetic42","x":1}' + ('\n```' if prefix.startswith('```') else '')
+    start = text.index('Synthetic42'); end = start + len('Synthetic42')
+    masked, _ = mask_and_restore(text, [finding('PASSWORD', start, end + 2)])
+    assert json.loads(masked[len(prefix):].removesuffix('\n```'))['x'] == 1
+
+
+@pytest.mark.parametrize('text', [
+    r'password = "a\"b"',
+    r"password = 'a\'b'",
+    r'password = r"a\"b"',
+    'password = """a\\"b"""',
+])
+def test_python_literal_preserves_syntax(text, recognizers):
+    ast.parse(text)
+    masked, spans = mask_and_restore(text, detections(text, recognizers, ['PASSWORD']))
+    ast.parse(masked)
+    assert spans
+    assert 'b' not in masked.split('=', 1)[1]
+
+
+def test_nested_and_duplicate_keys_are_all_protected(recognizers):
+    text = '{"password":"\\\"","nested":[{"password":"\\\\"}],"password":"$$","x":1}'
+    masked, spans = mask_and_restore(text, detections(text, recognizers))
+    document = json.loads(masked)
+    assert document['x'] == 1
+    assert len([r for r in spans if r.entity_type == 'PASSWORD']) == 3
+
+
+def test_two_names_in_separate_array_values_never_join():
+    text = '["Москва" "Гавана"]'  # Python adjacent literals, not valid JSON.
+    results = [finding('LOCATION', text.index(v), text.index(v)+len(v)) for v in ('Москва', 'Гавана')]
+    _, spans = mask_and_restore(text, results)
+    assert len(spans) == 2
+
+
+def test_noisy_ner_edges_cannot_consume_json_syntax():
+    text = '{"password":"Synthetic42","x":1}'
+    start = text.index('Synthetic42'); end = start + len('Synthetic42')
+    for left in range(start - 2, start + 3):
+        for right in range(end - 2, end + 4):
+            masked, _ = mask_and_restore(text, [finding('PASSWORD', left, right)])
+            assert json.loads(masked)['x'] == 1
+
+
+def test_generated_short_passwords_preserve_structure(recognizers):
+    # All combinations of syntax-sensitive symbols, plus Unicode/control input.
+    import itertools
+    alphabet = ['"', '\\', "'", '$', '\n', 'Ж', '😀']
+    for size in (1, 2, 3):
+        for chars in itertools.product(alphabet, repeat=size):
+            value = ''.join(chars)
+            text = json.dumps({'password': value, 'next': {'x': 1}})
+            masked, spans = mask_and_restore(text, detections(text, recognizers, ['PASSWORD']))
+            doc = json.loads(masked)
+            assert doc['next'] == {'x': 1}
+            assert doc['password'] != value, repr(value)
+            content_start = text.index('"', text.index(':')) + 1
+            content_end = text.index(',') - 1
+            assert all(any(r.start <= i < r.end for r in spans)
+                       for i in range(content_start, content_end)), repr(value)
+
+
+def test_raw_python_backslash_n_does_not_hide_name_letter():
+    text = r'org = r"\nСервис Плюс"'
+    start = text.index('nСервис')
+    _, spans = mask_and_restore(text, [finding('ORGANIZATION', start, len(text)-1)])
+    assert spans[0].start <= start < spans[0].end
+
+
+@pytest.mark.parametrize('policy', ['content', 'logistic'])
+def test_real_api_json_escaping_and_entity_filters(monkeypatch, recognizers, policy):
+    from fastapi.testclient import TestClient
+    from presidio_analyzer import AnalyzerEngine, RecognizerRegistry
+    from presidio import analyzer_server
+
+    monkeypatch.setenv('PRESIDIO_ANALYZER_BASE64_POLICY', policy)
+    registry = RecognizerRegistry(supported_languages=['ru'])
+    for recognizer in recognizers:
+        registry.add_recognizer(recognizer)
+    engine = AnalyzerEngine(registry=registry, nlp_engine=analyzer_server.nlp_engine,
+                            supported_languages=['ru'])
+    monkeypatch.setattr(analyzer_server, 'analyzer', engine)
+    monkeypatch.setattr(analyzer_server.ner_recognizer, 'require_ready', lambda: None)
+    monkeypatch.setattr(analyzer_server.ner_recognizer, 'analyze', lambda *_a, **_k: [])
+    api = TestClient(analyzer_server.app)
+    for value in ['"', '\\', '$$', '😀\\"']:
+        text = json.dumps({'password': value, 'x': 1})
+        response = api.post('/api/v1/analyze', json={'text': text, 'entities': ['PASSWORD'],
+                                                    'score_threshold': .35})
+        assert response.status_code == 200
+        findings = [finding(r['entity_type'], r['start'], r['end'], SOURCE_NATIVE_CREDENTIAL)
+                    for r in response.json()['entities']]
+        masked, _ = mask_and_restore(text, findings)
+        assert json.loads(masked)['password'] != value
+        assert json.loads(masked)['x'] == 1
+        excluded = api.post('/api/v1/analyze', json={'text': text, 'entities': ['RU_PASSPORT']})
+        assert excluded.json()['entities'] == []
+
+
+@pytest.mark.parametrize('key', [r'passw\u006frd', r'\u0061ddress'])
+def test_escaped_json_key_is_bound_to_its_own_string(key, recognizers):
+    value = '"' if 'passw' in key else 'ул. Ленина, д. 5, кв. "12"'
+    text = '{"%s":%s,"next":"ordinary"}' % (key, json.dumps(value))
+    masked, _ = mask_and_restore(text, detections(text, recognizers))
+    document = json.loads(masked)
+    decoded_key = json.loads('"' + key + '"')
+    assert document[decoded_key] != value
+    assert document['next'] == 'ordinary'
+
+
+def test_json_above_projection_limit_still_has_safe_mask_boundaries(recognizers):
+    # Lexical boundary safety is independent of the bounded decoded recognizer.
+    text = json.dumps({'padding': 'a' * 66000, 'password': '"', 'next': 'ordinary'})
+    masked, _ = mask_and_restore(text, detections(text, recognizers, ['PASSWORD']))
+    document = json.loads(masked)
+    assert document['padding'] == 'a' * 66000
+    assert document['next'] == 'ordinary'
+    assert document['password'] != '"'
+
+
+@pytest.mark.parametrize('projected', [False, True])
+def test_later_address_can_cover_a_trimmed_ner_remainder_inside_json(projected):
+    from result_merging import SOURCE_STRUCTURAL
+
+    value = 'password=Alpha42&tail ул. Ленина, д. 5'
+    text = json.dumps({'source': value, 'next': 'ordinary'}, ensure_ascii=False)
+    value_start = text.index('password=')
+    value_end = text.index('", "next"')
+    native_start = text.index('Alpha42')
+    native = finding('PASSWORD', native_start, native_start + len('Alpha42'), SOURCE_NATIVE_CREDENTIAL)
+    wide = finding('PASSWORD', value_start, value_end)
+    additive = finding('RU_ADDRESS', native_start, value_end, SOURCE_STRUCTURAL)
+    additive.recognition_metadata[RecognizerResult.RECOGNIZER_NAME_KEY] = (
+        'JsonStringRecognizer' if projected else 'RuAddressChainRecognizer'
+    )
+    if projected:
+        additive.recognition_metadata['projected_recognizer_name'] = 'RuAddressChainRecognizer'
+    import itertools
+    for order in itertools.permutations([native, wide, additive]):
+        masked, spans = mask_and_restore(text, order)
+        assert json.loads(masked)['next'] == 'ordinary'
+        assert 'Ленина' not in json.loads(masked)['source']
+        assert all(any(r.start <= i < r.end for r in spans)
+                   for i in range(text.index('ул.'), value_end))
+
+
+@pytest.mark.parametrize('entity_type', ['PASSWORD', 'PERSON', 'ORGANIZATION'])
+def test_wide_ner_from_a_key_masks_the_value_not_the_key(entity_type):
+    text = '{"payload":"MySecret42","next":"ordinary"}'
+    start = text.index('payload')
+    end = text.index('MySecret42') + len('MySecret42')
+    masked, spans = mask_and_restore(text, [finding(entity_type, start, end)])
+    document = json.loads(masked)
+    assert set(document) == {'payload', 'next'}
+    assert document['payload'] == '<MASK_0>'
+    assert document['next'] == 'ordinary'
+    assert text[spans[0].start:spans[0].end] == 'MySecret42'
+
+
+@pytest.mark.parametrize('ascii_only', [False, True])
+def test_wide_ner_expands_every_touched_value(ascii_only):
+    first, second = 'Первый секрет', 'Второй \\"секрет'
+    text = json.dumps({'a': first, 'b': second, 'next': 'ordinary'}, ensure_ascii=ascii_only)
+    first_raw = json.dumps(first, ensure_ascii=ascii_only)[1:-1]
+    second_raw = json.dumps(second, ensure_ascii=ascii_only)[1:-1]
+    # Deliberately starts/ends inside the two values, possibly inside escapes.
+    start = text.index(first_raw) + 2
+    end = text.index(second_raw) + len(second_raw) - 2
+    masked, spans = mask_and_restore(text, [finding('PASSWORD', start, end)])
+    assert len(spans) == 2
+    assert json.loads(masked) == {'a': '<MASK_0>', 'b': '<MASK_1>', 'next': 'ordinary'}
+
+
+@pytest.mark.parametrize('quote', ['"', "'", '"""', "'''"])
+def test_unclosed_literal_scan_has_bounded_escape_work(monkeypatch, quote):
+    import string_spans
+
+    original = string_spans._escape_end
+    calls = 0
+
+    def count(*args):
+        nonlocal calls
+        calls += 1
+        return original(*args)
+
+    monkeypatch.setattr(string_spans, '_escape_end', count)
+    text = quote + ('\\' + quote[0]) * 400
+    string_spans.StringSpans(text)
+    assert calls <= len(text) * 8
+
+
+def test_unclosed_literal_does_not_hide_a_later_line():
+    from string_spans import StringSpans
+
+    text = '"' + '\\"' * 100 + '\n' + '{"password":"Synthetic42"}'
+    start = text.index('Synthetic42')
+    literal = StringSpans(text).at(start)
+    assert literal is not None
+    assert text[literal.content_start:literal.content_end] == 'Synthetic42'
+
+
+@pytest.mark.parametrize('address', ["ул. Д'Артаньяна, дом 5", "ул. Ленина, д. 5, ориентир 'Север'"])
+def test_sql_address_doubled_quotes_keep_full_mask_and_restore(address, recognizers):
+    raw = address.replace("'", "''")
+    text = "INSERT INTO clients (address, note) VALUES ('" + raw + "', 'ordinary');"
+    masked, spans = mask_and_restore(text, detections(text, recognizers, ['RU_ADDRESS']))
+    start = text.index(raw)
+    assert all(any(r.start <= i < r.end for r in spans) for i in range(start, start + len(raw)))
+    assert "'ordinary'" in masked
+    assert spans
+
+
+def test_sql_escape_boundaries_are_indivisible():
+    from string_spans import StringSpans
+
+    text = "INSERT INTO clients (address) VALUES ('Д''Артаньяна');"
+    start = text.index("''")
+    strings = StringSpans(text)
+    assert strings.align(start + 1, start + 2) == (start, start + 2)
+
+
+def test_sensitive_key_only_is_not_discarded():
+    text = '{"Synthetic42":"ordinary"}'
+    start = text.index('Synthetic42')
+    masked, _ = mask_and_restore(text, [finding('PASSWORD', start, start + len('Synthetic42'))])
+    assert json.loads(masked) == {'<MASK_0>': 'ordinary'}
+
+
+@pytest.mark.parametrize('text', [
+    '["FirstSecret42", "SecondSecret42", "ordinary"]',
+    'values = ["FirstSecret42", "SecondSecret42", "ordinary"]',
+])
+def test_wide_ner_covers_separate_array_values(text):
+    start = text.index('FirstSecret42') + 2
+    end = text.index('SecondSecret42') + 4
+    masked, spans = mask_and_restore(text, [finding('PASSWORD', start, end)])
+    assert len(spans) == 2
+    assert 'FirstSecret42' not in masked and 'SecondSecret42' not in masked
+    assert 'ordinary' in masked
+    ast.parse(masked)
+
+
+@pytest.mark.parametrize('policy', ['content', 'logistic'])
+def test_api_wide_ner_masks_every_value_without_refusal(monkeypatch, policy):
+    from fastapi.testclient import TestClient
+    from presidio import analyzer_server
+
+    monkeypatch.setenv('PRESIDIO_ANALYZER_BASE64_POLICY', policy)
+    monkeypatch.setattr(analyzer_server.ner_recognizer, 'require_ready', lambda: None)
+    text = '{"a":"FirstSecret42","b":"SecondSecret42","next":"ordinary"}'
+    start = text.index('FirstSecret42') + 2
+    end = text.index('SecondSecret42') + 4
+    monkeypatch.setattr(analyzer_server.ner_recognizer, 'analyze',
+                        lambda *_a, **_kw: [finding('PASSWORD', start, end)])
+    response = TestClient(analyzer_server.app).post('/api/v1/analyze', json={
+        'text': text, 'entities': ['PASSWORD'], 'score_threshold': .35,
+    })
+    assert response.status_code == 200
+    results = [finding(row['entity_type'], row['start'], row['end'])
+               for row in response.json()['entities']]
+    masked, _ = mask_and_restore(text, results)
+    assert json.loads(masked) == {'a': '<MASK_0>', 'b': '<MASK_1>', 'next': 'ordinary'}

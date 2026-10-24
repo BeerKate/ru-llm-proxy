@@ -48,6 +48,36 @@ def _assert_rule_match(recognizer, text, rule_id, entity_type, expected_value):
     assert result.recognition_metadata[RULE_SOURCE_METADATA_KEY] == RULE_SOURCE
 
 
+@pytest.mark.parametrize("value", ["-$", "!", "$$", "@#%&", "()[]{}", "\\", "\"\"", " -$ "])
+@pytest.mark.parametrize("key", ["password", "DB_PASSWORD", "Пароль"])
+def test_explicit_punctuation_password_is_covered_in_full(value, key):
+    text = f"{key}='{value}'"
+    _assert_rule_match(PasswordRecognizer(), text, "credential.kv.password", "PASSWORD", value)
+
+
+@pytest.mark.parametrize("text", ["bash-$", "zsh-$", "-$", "echo '-$'", "password='   '",
+                                  "password=${?}", "password=$()", "password=$PASSWORD",
+                                  "password=<REDACTED>", "password=[REDACTED]"])
+def test_punctuation_fix_keeps_prompts_and_template_references_inert(text):
+    assert PasswordRecognizer().analyze(text, ["PASSWORD"]) == []
+
+
+def test_short_alphabetic_password_policy_and_other_recognizers_are_unchanged():
+    assert PasswordRecognizer().analyze("password='ab'", ["PASSWORD"]) == []
+    assert LoginRecognizer().analyze("login='-$'", ["LOGIN"]) == []
+
+
+@pytest.mark.parametrize("text", ["password == 'value'", "password={}", "password => other",
+                                  "password='{}{}'.format(first, second)"])
+def test_punctuation_rule_does_not_capture_operator_or_template_prefixes(text):
+    assert PasswordRecognizer().analyze(text, ["PASSWORD"]) == []
+
+
+def test_bare_punctuation_password_and_quoted_braces_are_literal_values():
+    _assert_rule_match(PasswordRecognizer(), "password=-$", "credential.kv.password", "PASSWORD", "-$")
+    _assert_rule_match(PasswordRecognizer(), "password='{}{}'", "credential.kv.password", "PASSWORD", "{}{}")
+
+
 AWS_ACCESS_TOKEN = "AKIA" + "A2B3C4D5E6F7G2H3"
 BEDROCK_LONG_KEY = "ABSK" + "A" * 109
 BEDROCK_SHORT_KEY = "bedrock-api-key-YmVkcm9jay5hbWF6b25hd3MuY29t"

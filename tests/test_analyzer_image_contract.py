@@ -79,6 +79,7 @@ def test_production_image_uses_verified_local_only_model():
     assert recognizer.count("local_files_only=True") == 2
     assert recognizer.count("trust_remote_code=False") == 2
     assert "COPY presidio/text_chunking.py ." in dockerfile
+    assert "COPY presidio/string_spans.py ." in dockerfile
 
 
 def test_production_image_enforces_cpu_only_runtime():

@@ -330,6 +330,7 @@ def _analysis_source_files() -> tuple[Path, ...]:
         root / "analyzer_server.py",
         root / "entity_types.py",
         root / "result_merging.py",
+        root / "string_spans.py",
         root / "text_chunking.py",
     ]
     for directory in (root / "ner", root / "recognizers"):
