@@ -122,6 +122,7 @@ COPY presidio/entity_types.py .
 COPY presidio/model_artifact.py .
 COPY presidio/model_profiles.py .
 COPY presidio/result_merging.py .
+COPY presidio/string_spans.py .
 COPY presidio/text_chunking.py .
 COPY presidio/real_model_smoke.py .
 COPY presidio/verify_cpu_runtime.py .

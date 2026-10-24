@@ -1,7 +1,9 @@
 """Real Analyzer corpus coverage, captured egress, exact echo and block flows."""
 
 import argparse
+import base64
 import json
+import os
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -43,9 +45,56 @@ def payload_for(text, api, stream, arguments):
     return payload
 
 
+def check_base64_policy(analyzer_url, proxy_url, block_proxy_url, capture_url):
+    policy = os.environ.get("PRESIDIO_ANALYZER_BASE64_POLICY", "content")
+    value = "U3ludGhldGljLVBhc3N3b3JkLTIwMjY="
+    cases = [
+        ("escaped-key", r'{"\u0070assword_base64":"\n' + value + r'\n"}', value),
+        ("short-email", "YUBiLnJ1", "YUBiLnJ1"),
+    ]
+    if policy == "logistic":
+        binary = "c3ludGhldGljLWJpbmFyeS0AAQItMDIwMjY="
+        line = base64.b64encode((('password="Synthetic-Pass-2026"' + " " * 48)[:48]).encode()).decode()
+        block = line + "\nQr3yIQbw"
+        cases.extend([("binary", binary, binary), ("mime", block, block)])
+    flows = blocked = 0
+    for case_id, text, protected in cases:
+        entities = _request(analyzer_url, "/api/v1/analyze", {"text": text})["entities"]
+        start = text.index(protected)
+        assert all(
+            any(r["start"] <= index < r["end"] for r in entities)
+            for index in range(start, start + len(protected)) if not text[index].isspace()
+        ), (case_id, "incomplete Base64 coverage")
+        for api in ("chat/completions", "responses"):
+            for stream in (False, True):
+                for arguments in (False, True):
+                    context = (policy, case_id, api, stream, arguments)
+                    payload = payload_for(text, api, stream, arguments)
+                    reset(capture_url)
+                    response = _request(proxy_url, "/v1/" + api, payload, stream=stream)
+                    assert _restored_text(response, api, stream) == text, (context, "restoration")
+                    captured = capture(capture_url)
+                    assert captured["provider_requests"] == 1, context
+                    assert captured["provider_saw_pii_placeholder"], context
+                    assert not captured["provider_saw_canary"], (context, "sensitive egress")
+                    flows += 1
+                    reset(capture_url)
+                    try:
+                        _request(block_proxy_url, "/v1/" + api, payload, stream=stream)
+                    except urllib.error.HTTPError as error:
+                        assert error.code == 422, (context, error.code)
+                    else:
+                        raise AssertionError((context, "block request succeeded"))
+                    assert capture(capture_url)["provider_requests"] == 0, context
+                    blocked += 1
+    print(json.dumps({"status": "ok", "base64_policy": policy, "cases": len(cases), "echo_flows": flows, "blocked_flows": blocked}))
+
+
 def check_chunk_boundaries(analyzer_url, proxy_url, block_proxy_url, capture_url):
     cases = [
-        ("long", "Base64", "BASE64_DATA", "", "A" * 140000, False),
+        # Whitespace is valid inside a declared encoding. Keep this a source-span
+        # boundary test, not an accidental NER load benchmark on repeated tokens.
+        ("long", "Base64", "BASE64_DATA", "", "A" * 64 + "\n" + " " * 140000 + "B" * 64, True),
         ("offset", "payload_b64", "BASE64_DATA", " " * 115000, "A" * 20000, False),
         ("multiline", "password_b64", "PASSWORD", " " * 115000,
          "A" * 10000 + "\n    " + "B" * 10000, True),
@@ -162,6 +211,7 @@ def check(analyzer_url, proxy_url, block_proxy_url, capture_url):
                     blocked += 1
     print(json.dumps({"status": "ok", "dkb_files": len(cases), "annotations": annotations, "json_annotations": json_annotations, "echo_flows": flows, "blocked_flows": blocked, "final_blocked_flows": final_blocked}))
     check_chunk_boundaries(analyzer_url, proxy_url, block_proxy_url, capture_url)
+    check_base64_policy(analyzer_url, proxy_url, block_proxy_url, capture_url)
 
 
 if __name__ == "__main__":

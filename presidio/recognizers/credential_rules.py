@@ -92,8 +92,12 @@ _ASSIGNMENT_VALUE = (
     r"System\.getenv\([^\r\n]+\)|"
     r"[A-Za-z_$][\w$]*\[[\"'][^\r\n]+[\"']\]|"
     r"(?:config|settings|env|process\.env)(?:\.[A-Za-z_$][\w$]*)+|"
-    r'"[^"\r\n]+"|'
-    r"'[^'\r\n]+'|"
+    r"'\\'(?=$|[\s,;])|"
+    r'"\\"(?=$|[\s,;])|'
+    r'"""(?:[^"\\]|\\.|"(?!""))*"""|'
+    r'"(?:[^"\\\r\n]|\\.)+"|'
+    r"'''(?:[^'\\]|\\.|'(?!''))*'''|"
+    r"'(?:[^'\\\r\n]|\\.)+'|"
     r"«[^»\r\n]+»|"
     r"“[^”\r\n]+”|"
     r"[^\s,;&}\]\r\n\"']+"
@@ -123,7 +127,7 @@ def _assignment_rule(rule_id: str, key_regex: str, score: float) -> _CredentialR
         regex=re.compile(
             rf"(?<![\w.-])[\"']?(?:{key_regex})[\"']?"
             rf"(?:[ \t]*[:=][ \t]*|[ \t]+[—–][ \t]+)"
-            rf"{_ASSIGNMENT_VALUE}",
+            rf"(?:(?i:r|u|b|br|rb)(?=[\"']))?{_ASSIGNMENT_VALUE}",
             re.IGNORECASE | re.MULTILINE,
         ),
         score=score,
@@ -145,7 +149,10 @@ def _strip_value_wrapper(text: str, start: int, end: int) -> tuple[int, int, str
         start += 1
     while end > start and text[end - 1].isspace():
         end -= 1
-    if end - start >= 2 and _QUOTE_PAIRS.get(text[start]) == text[end - 1]:
+    if end - start >= 6 and text[start:start + 3] in ('"""', "'''") and text[end - 3:end] == text[start:start + 3]:
+        start += 3
+        end -= 3
+    elif end - start >= 2 and _QUOTE_PAIRS.get(text[start]) == text[end - 1]:
         start += 1
         end -= 1
     else:

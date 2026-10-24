@@ -1,7 +1,12 @@
 # Файлы модели для профиля `tiny2`
 
-Модель rubert-tiny2 для маскировки не опубликована на Hugging Face. Чтобы собрать
-образ Analyzer с ней, положите сюда шесть файлов из манифеста
+Модель опубликована на Hugging Face:
+[Katerina-Bir/rubert-tiny2-secret-detection](https://huggingface.co/Katerina-Bir/rubert-tiny2-secret-detection).
+
+Закреплённая ревизия Hugging Face:
+`4137142e79d52b0b69370e0e3dceb2d6ad82591d`.
+
+Чтобы собрать образ Analyzer, положите сюда шесть файлов из манифеста
 `presidio/model_manifest.tiny2.json`:
 
 ```
@@ -13,9 +18,9 @@ tokenizer_config.json
 vocab.txt
 ```
 
-Получите файлы checkpoint `tiny2-mix-a-s1-ft-spacy-free-20261013-a-e2-b2` у владельца артефакта и
-положите их в эту папку. Расположение исходного архива и постоянное хранилище
-весов должны быть согласованы до промышленной сборки.
+Скачайте перечисленные файлы из указанной ревизии Hugging Face и положите
+их в `presidio/model-artifacts/tiny2/`. Они соответствуют артефакту
+`tiny2-mix-a-s1-ft-spacy-free-20261013-a-e2-b2`; идентичность проверяется манифестом.
 
 Затем соберите и запустите стек с профилем
 ([развёртывание](../../../docs/deployment.md#tiny2)):

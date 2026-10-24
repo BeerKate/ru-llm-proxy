@@ -11,11 +11,13 @@ from recognizers.credential_rules import (
     AuthTokenRecognizer, LoginRecognizer, PasswordRecognizer, SecretKeyRecognizer,
     _is_inert_credential_value,
 )
+from recognizers.ru_passport_ext import RuPassportExtRecognizer
 
 
 MAX_JSON_CHARS = 65536
 _STRING = re.compile(r'"(?:[^"\\]|\\.)*"', re.S)
 _KEY_SEPARATOR = re.compile(r"\s*:")
+_MEMBER_SEPARATOR = re.compile(r"\s*:\s*")
 
 
 def _reject_json_constant(value):
@@ -34,6 +36,26 @@ def iter_json_string_values(text):
         if _KEY_SEPARATOR.match(text, match.end()):
             continue
         yield decoded_string_offsets(text, match.start(), match.end())
+
+
+def iter_json_keyed_strings(text):
+    """Yield decoded key, decoded value and value offsets for string object members."""
+    if len(text) > MAX_JSON_CHARS or not text.lstrip().startswith(("{", "[", '"')):
+        return
+    try:
+        json.loads(text, parse_constant=_reject_json_constant)
+    except (ValueError, RecursionError):
+        return
+    key = None
+    value_start = None
+    for match in _STRING.finditer(text):
+        separator = _MEMBER_SEPARATOR.match(text, match.end())
+        if separator:
+            key = json.loads(match.group())
+            value_start = separator.end()
+            continue
+        if match.start() == value_start:
+            yield (key, *decoded_string_offsets(text, match.start(), match.end()))
 
 
 def decoded_string_offsets(text, start, end):
@@ -67,9 +89,9 @@ class JsonStringRecognizer(EntityRecognizer):
             name="JsonStringRecognizer",
             version="1.0.0",
         )
-        from recognizers import PLAIN_RECOGNIZERS
+        from recognizers import PLAIN_RECOGNIZERS, ADDITIVE_RECOGNIZERS
         from recognizers.base64_data import Base64DataRecognizer
-        self._recognizers = [cls() for cls in PLAIN_RECOGNIZERS] + [Base64DataRecognizer()]
+        self._recognizers = [cls() for cls in [*PLAIN_RECOGNIZERS, *ADDITIVE_RECOGNIZERS]] + [Base64DataRecognizer()]
         self._fields = [PasswordRecognizer(), SecretKeyRecognizer(), AuthTokenRecognizer(), LoginRecognizer(), Base64DataRecognizer()]
 
     def load(self):
@@ -92,8 +114,15 @@ class JsonStringRecognizer(EntityRecognizer):
                 value_start = match.end() + delimiter.end()
                 continue
             decoded, offsets = decoded_string_offsets(text, match.start(), match.end())
-            if match.start() == value_start and not _is_inert_credential_value(decoded):
+            if match.start() == value_start and decoded:
                 for recognizer in self._fields:
+                    accepted = not _is_inert_credential_value(decoded)
+                    if isinstance(recognizer, PasswordRecognizer):
+                        accepted = accepted or recognizer._accept_match(
+                            decoded, "credential.kv.password", json.dumps(decoded), ""
+                        ) or not decoded.strip()
+                    if not accepted:
+                        continue
                     if not set(recognizer.supported_entities) & set(entities or self.supported_entities):
                         continue
                     for finding in recognizer.analyze(f'{key}="synthetic-value-123"', entities):
@@ -112,10 +141,17 @@ class JsonStringRecognizer(EntityRecognizer):
                 if not requested:
                     continue
                 for finding in recognizer.analyze(decoded, list(requested), None):
+                    # An explicit passport key can confirm its own scalar, not
+                    # another member/array item encountered later in the source.
+                    if (isinstance(recognizer, RuPassportExtRecognizer)
+                            and finding.score < 0.35 and match.start() == value_start
+                            and recognizer._CONTEXT_RE.search(key or '')):
+                        finding.score += 0.35
                     if finding.score < 0.35:
                         continue
                     metadata = dict(finding.recognition_metadata or {})
                     metadata["json_string_projection"] = True
+                    metadata["projected_recognizer_name"] = recognizer.name
                     # Presidio associates results with registered recognizer instances.
                     metadata[RecognizerResult.RECOGNIZER_NAME_KEY] = self.name
                     metadata[RecognizerResult.RECOGNIZER_IDENTIFIER_KEY] = self.id

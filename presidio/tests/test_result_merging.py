@@ -504,8 +504,6 @@ def test_additive_address_rule_completes_a_partial_native_address():
     [
         ('__all__ = ["UniSpeechSatForCTC"]', "Uni"),
         ('__all__ = ["UniSpeechSatForCTC"]', "UniSpeechSatForC"),
-        ("name: Name for the TensorFlow ops.", "TensorF"),
-        ('"Qwen2ForCausalLM",', "alLM"),
         ("service = user_service_factory()", "service_fact"),
     ],
 )
@@ -524,12 +522,14 @@ def test_model_organization_cutting_a_code_identifier_is_suppressed(text, value)
     [
         ("# Copyright 2024 The HuggingFace Inc. team.", "HuggingFace Inc", "ORGANIZATION"),
         ("author: BeerKate", "BeerKate", "ORGANIZATION"),
+        ("name: Name for the TensorFlow ops.", "TensorF", "ORGANIZATION"),
+        ('"Qwen2ForCausalLM",', "alLM", "ORGANIZATION"),
         ("Договор с ООО «РомашкаСервис» подписан", "РомашкаСер", "ORGANIZATION"),
         ("Smiths family", "Smith", "ORGANIZATION"),
         ("class PetrovReport:", "Petrov", "PERSON"),
     ],
 )
-def test_whole_words_cyrillic_and_other_types_are_not_identifier_fragments(text, value, entity_type):
+def test_organizations_without_code_proof_and_other_types_are_preserved(text, value, entity_type):
     start = text.index(value)
     ner = _result(entity_type, start, start + len(value), 0.9, SOURCE_NER)
 
@@ -746,3 +746,103 @@ def test_model_organization_keeps_spaced_or_brand_punctuation(text, value):
     organization = _result("ORGANIZATION", start, start + len(value), 0.9, SOURCE_NER)
 
     assert [(text[r.start:r.end]) for r in merge_results(text, [organization]).results] == [value]
+
+
+@pytest.mark.parametrize("separator", [" ", "\t", "\n", " \t "])
+@pytest.mark.parametrize(
+    "entity_type,recognizer_name",
+    [("RU_ADDRESS", "RuAddressChainRecognizer"),
+     ("RU_PASSPORT", "RuPassportExtRecognizer")],
+)
+def test_shortened_ner_fragment_does_not_hide_a_later_additive_remainder(
+    separator, entity_type, recognizer_name,
+):
+    # Controlled recognizer outputs: the test does not claim BERT predicts
+    # these boundaries. A virtual coverage bit must correspond to a real mask.
+    text = "address=Alpha42&tail" + separator + "ул. Ленина, д. 5"
+    start = text.index("Alpha42")
+    native = _result("PASSWORD", start, start + len("Alpha42"), .9, SOURCE_NATIVE_CREDENTIAL)
+    wide = _result("PASSWORD", 0, len(text), .8, SOURCE_NER)
+    additive = _result(entity_type, start, len(text), .75,
+                       SOURCE_STRUCTURAL, recognizer_name)
+    expected = None
+    for order in itertools.permutations([native, wide, additive]):
+        outcome = merge_results(text, order)
+        spans = outcome.results
+        covered = {i for r in spans for i in range(r.start, r.end)}
+        assert all(i in covered for i in range(text.index("ул."), len(text)))
+        assert next(r for r in spans if r.start == start) is native
+        assert all(a.end <= b.start for a, b in zip(spans, spans[1:]))
+        summary = _summary(outcome)
+        if expected is None:
+            expected = summary
+        assert summary == expected
+
+
+def test_multiple_nested_additive_losers_complete_only_their_own_ranges():
+    text = "password=Alpha42&tail middle final visible"
+    start = text.index("Alpha42")
+    native = _result("PASSWORD", start, start + len("Alpha42"), .9, SOURCE_NATIVE_CREDENTIAL)
+    wide = _result("PASSWORD", 0, len(text), .8, SOURCE_NER)
+    address = _result("RU_ADDRESS", start, text.index(" final"), .75,
+                      SOURCE_STRUCTURAL, "RuAddressChainRecognizer")
+    passport = _result("RU_PASSPORT", start + 1, text.index(" visible"), .7,
+                       SOURCE_STRUCTURAL, "RuPassportExtRecognizer")
+    expected = None
+    for order in itertools.permutations([native, wide, address, passport]):
+        outcome = merge_results(text, order)
+        spans = outcome.results
+        covered = {i for r in spans for i in range(r.start, r.end)}
+        assert all(text[i].isspace() or i in covered
+                   for i in range(start, text.index(" visible")))
+        assert not any(i in covered for i in range(text.index("visible"), len(text)))
+        assert all(a.end <= b.start for a, b in zip(spans, spans[1:]))
+        if expected is None:
+            expected = _summary(outcome)
+        assert _summary(outcome) == expected
+
+
+def test_glued_tail_alone_does_not_mask_unconfirmed_following_text():
+    text = "password=Alpha42&tail ordinary text"
+    start = text.index("Alpha42")
+    native = _result("PASSWORD", start, start + len("Alpha42"), .9, SOURCE_NATIVE_CREDENTIAL)
+    wide = _result("PASSWORD", 0, len(text), .8, SOURCE_NER)
+    for order in itertools.permutations([native, wide]):
+        spans = merge_results(text, order).results
+        assert [text[r.start:r.end] for r in spans] == ["Alpha42", "&tail"]
+
+
+def test_two_exact_winners_do_not_hide_gaps_from_an_additive_rule():
+    text = "key=Alpha42&tail middle Beta77&more final visible"
+    first = text.index("Alpha42")
+    second = text.index("Beta77")
+    end = text.index(" visible")
+    password = _result("PASSWORD", first, first + len("Alpha42"), .9, SOURCE_NATIVE_CREDENTIAL)
+    secret = _result("SECRET_KEY", second, second + len("Beta77"), .9, SOURCE_NATIVE_CREDENTIAL)
+    wide = _result("PASSWORD", 0, len(text), .8, SOURCE_NER)
+    address = _result("RU_ADDRESS", first, end, .75,
+                      SOURCE_STRUCTURAL, "RuAddressChainRecognizer")
+    expected = None
+    for order in itertools.permutations([password, secret, wide, address]):
+        outcome = merge_results(text, order)
+        spans = outcome.results
+        covered = {i for r in spans for i in range(r.start, r.end)}
+        assert all(text[i].isspace() or i in covered for i in range(first, end))
+        assert not any(i in covered for i in range(end, len(text)))
+        assert password in spans and secret in spans
+        assert all(a.end <= b.start for a, b in zip(spans, spans[1:]))
+        if expected is None:
+            expected = _summary(outcome)
+        assert _summary(outcome) == expected
+
+
+def test_excluding_additive_entity_preserves_only_the_allowed_ner_tail():
+    text = "password=Alpha42&tail ул. Ленина, д. 5"
+    start = text.index("Alpha42")
+    native = _result("PASSWORD", start, start + len("Alpha42"), .9, SOURCE_NATIVE_CREDENTIAL)
+    wide = _result("PASSWORD", 0, len(text), .8, SOURCE_NER)
+    address = _result("RU_ADDRESS", start, len(text), .75,
+                      SOURCE_STRUCTURAL, "RuAddressChainRecognizer")
+    for order in itertools.permutations([native, wide, address]):
+        spans = merge_results(text, order, requested_entities=["PASSWORD"]).results
+        assert [text[r.start:r.end] for r in spans] == ["Alpha42", "&tail"]

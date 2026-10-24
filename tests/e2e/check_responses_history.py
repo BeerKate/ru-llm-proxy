@@ -80,6 +80,20 @@ def run(base="http://localhost:4000", key="sk-test-master"):
         })
         assert status in (409, 422), (status, body)
         count += 1
+    # Check the mapping limit independently from NER cost using the existing
+    # deterministic Analyzer fixture; a rejected request must never reach the model.
+    with urllib.request.urlopen("http://mock-upstream:8080/capture", timeout=5) as result:
+        before = json.load(result)["provider_requests"]
+    large = "statechat" + "a" * (1024 * 1024) + "@example.test"
+    for stream in (False, True):
+        status, body = request(base, key, {
+            "model": "mock-chat", "input": large, "stream": stream,
+        })
+        assert status == 413, ("oversized mapping", stream, status)
+        assert large[:72] not in body and "a" * 64 not in body, "Oversized mapping error exposed the source"
+        count += 1
+    with urllib.request.urlopen("http://mock-upstream:8080/capture", timeout=5) as result:
+        assert json.load(result)["provider_requests"] == before, "Oversized mapping reached provider"
     print(json.dumps({"responses_history_checks": count, "passed": True}))
 
 

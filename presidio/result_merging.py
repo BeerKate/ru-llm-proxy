@@ -9,6 +9,7 @@ from functools import lru_cache
 from typing import Iterable
 
 from presidio_analyzer import RecognizerResult
+from string_spans import StringSpans
 
 
 DETECTION_SOURCE_METADATA_KEY = "ru_llm_detection_source"
@@ -77,15 +78,26 @@ _CONTRACT_CONTEXT_RE = re.compile(
     r"соглашени(?:е|я|ю|ем|и|й|ям|ями|ях)|"
     r"contracts?|agreements?"
     r")(?![\w])"
-    # Identifier keys with an explicit number suffix (contract_id,
-    # contractNumber, client_contract_no, номер_договора) followed by an
-    # assignment. A bare contract_* key such as contract_address in
-    # smart-contract code, or a type name in prose, is not enough.
-    r"|(?<![^\W_])(?:contract|agreement)s?[_\-.]?(?:id|no|nr|num|number|ref)"
-    r"(?![a-z])(?=[\"'`]?[ \t]*[:=])"
-    r"|(?<![^\W_])(?:номер_договор\w*|nomer_dogovora|"
-    r"dogovora?[_\-.]?(?:id|no|nr|num|nomer|number))(?![a-z])(?=[\"'`]?[ \t]*[:=])"
 )
+# Identifier keys are assignment evidence, never sentence-wide context.
+_CONTRACT_KEY_RE = re.compile(
+    r"(?i)(?<![^\W_])(?:contract|agreement)s?[_\-.]?(?:id|no|nr|num|number|ref)$"
+    r"|(?<![^\W_])(?:номер_договор\w*|nomer_dogovora|"
+    r"dogovora?[_\-.]?(?:id|no|nr|num|nomer|number))$"
+)
+_CONTRACT_ASSIGNMENT_RE = re.compile(
+    r"(?<![\w.\-])(?P<key>\"(?:[^\"\\\r\n]|\\.)+\"|"
+    r"'(?:[^'\\\r\n]|\\.)+'|[A-Za-zА-Яа-яЁё_][\w.\-]*)"
+    r"[ \t]*(?P<op>[:=])(?![:=])[ \t\r\n]*"
+)
+_CONTRACT_LABEL_KEY_RE = re.compile(
+    r"(?i)(?:номер\s+(?:договора|контракта|соглашения)|"
+    r"(?:contract|agreement)\s+(?:number|no\.?|id|ref))"
+)
+_CONTRACT_SCALAR_RE = re.compile(r"[^\s,;{}\[\]():=]+")
+_CONTRACT_KEY_SEPARATOR_RE = re.compile(r"\s*:")
+_CONTRACT_HINT_RE = re.compile(r"(?i)договор|контракт|соглашени|contract|agreement|nomer_dogovora|dogovor|\\u")
+
 _CONTRACT_CANDIDATE_RE = re.compile(
     r"(?<![\w])"
     r"(?P<value>[A-Za-zА-Яа-яЁё0-9]"
@@ -278,40 +290,153 @@ def detection_source(result: RecognizerResult) -> str:
     return SOURCE_STRUCTURAL
 
 
-def contract_context_evidence(text: str) -> tuple[tuple[int, int], ...]:
-    """Return contract-number candidates backed by nearby contract context."""
-    evidence = []
+def _contract_candidates(text):
+    """The existing number policy, independent of how its context is confirmed."""
     for match in _CONTRACT_CANDIDATE_RE.finditer(text):
         value = match.group("value")
         if not any(character.isdigit() for character in value):
             continue
-        normalized_value = value.replace("\u00ad", "")
+        normalized = value.replace("\u00ad", "")
         if (
-            _DATE_LIKE_RE.fullmatch(normalized_value)
-            or _DOTTED_VERSION_RE.fullmatch(normalized_value)
-            or (normalized_value.isdigit() and len(normalized_value) < 6)
+            _DATE_LIKE_RE.fullmatch(normalized)
+            or _DOTTED_VERSION_RE.fullmatch(normalized)
+            or (normalized.isdigit() and len(normalized) < 6)
         ):
             continue
-
         start, end = match.span("value")
         while end > start and text[end - 1] in ".-/\u00ad":
             end -= 1
-        if end - start < 3:
-            continue
+        if end - start >= 3:
+            yield start, end
 
-        context_start = max(0, start - 96)
+
+def _contract_key(key):
+    return bool(_CONTRACT_KEY_RE.search(key) or _CONTRACT_CONTEXT_RE.fullmatch(key)
+                or _CONTRACT_LABEL_KEY_RE.fullmatch(key))
+
+
+def _literal_view(text, literal):
+    """Reuse validated JSON escape projection; leave other language literals raw."""
+    import json
+    from recognizers.json_strings import decoded_string_offsets
+
+    prefix = text[max(0, literal.start - 3):literal.start]
+    raw = re.search(r"(?i)(?<!\w)(?:r|br|rb|fr|rf)$", prefix) is not None
+    if not raw and text[literal.start] == '"':
+        try:
+            json.loads(text[literal.start:literal.end])
+        except (ValueError, RecursionError):
+            pass
+        else:
+            return decoded_string_offsets(text, literal.start, literal.end)
+    return (text[literal.content_start:literal.content_end],
+            range(literal.content_start, literal.content_end + 1))
+
+
+def _contract_bindings(text, strings):
+    """Bind each assignment to one scalar, never to a container or next field."""
+    import ast
+
+    bindings = []
+    keys = []
+    for match in _CONTRACT_ASSIGNMENT_RE.finditer(text):
+        left, right = match.span("key")
+        owner = strings.at(left)
+        if owner is not None and (owner.start, owner.end) != (left, right):
+            # Analyze textual assignments inside a source string in its own view.
+            continue
+        key = match.group("key")
+        quoted = key[0] in "\"'"
+        if quoted:
+            try:
+                key = ast.literal_eval(key)
+            except (ValueError, SyntaxError):
+                continue
+        before = left - 1
+        while before >= 0 and text[before] in " \t":
+            before -= 1
+        structured = (quoted or match.group("op") == "=" or before < 0
+                      or text[before] in "\r\n{[(,;")
+        confirmed = _contract_key(key)
+        keys.append((left, right))
+        start = match.end()
+        literal = strings.at(start)
+        if literal is not None and literal.start == start:
+            decoded, offsets = _literal_view(text, literal)
+            bindings.append((start, literal.end, confirmed, structured, decoded, offsets))
+        else:
+            scalar = _CONTRACT_SCALAR_RE.match(text, start)
+            if scalar:
+                end = scalar.end()
+                bindings.append((start, end, confirmed, structured,
+                                 text[start:end], range(start, end + 1)))
+                if (not quoted and match.group("op") == ":"
+                        and _CONTRACT_CONTEXT_RE.fullmatch(key)
+                        and next(_contract_candidates(text[start:end]), None) is not None):
+                    # A prose label such as "Договоры: AA-... и BB-..." still
+                    # introduces a list. Other assignment values remain scoped
+                    # independently; null/containers never introduce prose.
+                    keys.pop()
+    return bindings, keys
+
+
+def _plain_contract_evidence(text, strings):
+    bindings, keys = _contract_bindings(text, strings)
+    evidence = []
+    for _, _, confirmed, _, decoded, offsets in bindings:
+        if confirmed:
+            evidence.extend((offsets[start], offsets[end])
+                            for start, end in _contract_candidates(decoded))
+
+    key_starts = [start for start, _ in keys]
+    binding_starts = [start for start, *_ in bindings]
+    for start, end in _contract_candidates(text):
+        key_index = bisect_right(key_starts, start) - 1
+        if key_index >= 0 and start < keys[key_index][1]:
+            continue
+        literal = strings.at(start)
+        binding_index = bisect_right(binding_starts, start) - 1
+        if binding_index >= 0:
+            left, right, _, structured, _, _ = bindings[binding_index]
+            if left <= start < right and structured and literal is None:
+                continue
+        context_start = max(0, start - 96, literal.content_start if literal else 0)
         for index in range(start - 1, context_start - 1, -1):
             if _is_sentence_boundary(text, index):
                 context_start = index + 1
                 break
         context = text[context_start:start]
-        has_contract_context = _CONTRACT_CONTEXT_RE.search(context) is not None
-        has_disqualifier = _CONTRACT_DISQUALIFIER_RE.search(context) is not None
-        has_explicit_number = _EXPLICIT_CONTRACT_NUMBER_RE.search(context) is not None
-        if has_contract_context and (not has_disqualifier or has_explicit_number):
+        has_context = False
+        for match in _CONTRACT_CONTEXT_RE.finditer(text, context_start, start):
+            index = bisect_right(key_starts, match.start()) - 1
+            if index >= 0 and match.start() < keys[index][1]:
+                continue
+            if strings.at(match.start()) is literal:
+                has_context = True
+                break
+        disqualified = _CONTRACT_DISQUALIFIER_RE.search(context) is not None
+        explicit = _EXPLICIT_CONTRACT_NUMBER_RE.search(context) is not None
+        if has_context and (not disqualified or explicit):
             evidence.append((start, end))
+    return evidence
 
-    return tuple(dict.fromkeys(evidence))
+
+def contract_context_evidence(
+    text: str, *, _strings: StringSpans | None = None,
+) -> tuple[tuple[int, int], ...]:
+    """Separate assignment-owned values from natural-language contract context."""
+    if _CONTRACT_HINT_RE.search(text) is None:
+        return ()
+    strings = _strings if _strings is not None else StringSpans(text)
+    evidence = _plain_contract_evidence(text, strings)
+    for literal in strings.spans:
+        # Keys are not free-text context for a different value.
+        if _CONTRACT_KEY_SEPARATOR_RE.match(text, literal.end):
+            continue
+        decoded, offsets = _literal_view(text, literal)
+        for start, end in _plain_contract_evidence(decoded, StringSpans(decoded)):
+            evidence.append((offsets[start], offsets[end]))
+    return tuple(sorted(set(evidence)))
 
 
 def _is_sentence_boundary(text: str, index: int) -> bool:
@@ -336,14 +461,50 @@ def merge_results(
         requested_entities = tuple(requested_entities)
     decisions = []
     valid_results = []
-    contract_evidence = contract_context_evidence(text)
+    strings = StringSpans(text)
+    contract_evidence = contract_context_evidence(text, _strings=strings)
     reference_spans = []
-    results = list(results)
+    normalized = []
+    for result in results:
+        if not _valid_span(result, len(text)):
+            normalized.append(result)  # Preserve the existing invalid-span decision.
+            continue
+        literal = strings.at(result.start)
+        # Existing specialized rules may deliberately cover a concatenated key
+        # across several code literals. Keep that established native contract;
+        # Statistical/additive findings crossing syntax widen to every touched
+        # value instead of losing their tail or masking a service key alone.
+        bound_to_values = (
+            detection_source(result) == SOURCE_NER
+            or _recognizer_name(result) in _ADDITIVE_RECOGNIZERS
+        )
+        ranges = [(result.start, result.end)]
+        if bound_to_values:
+            ranges = strings.mask_ranges(
+                result.start, result.end, name=result.entity_type in _JOINED_NAME_TYPES,
+            )
+        elif literal is None or result.end <= literal.end:
+            bounds = strings.align(
+                result.start, result.end,
+                name=result.entity_type in _JOINED_NAME_TYPES,
+            )
+            ranges = [bounds] if bounds else []
+        for bounds in ranges:
+            normalized.append(
+                result if bounds == (result.start, result.end)
+                else _copy_name(result, start=bounds[0], end=bounds[1])
+            )
+    results = normalized
+    # The experimental cascade adds coverage; it must never compete with native
+    # credential or NER findings for ownership of their existing ranges.
+    logistic_results = [r for r in results if _is_logistic_base64(r)]
+    results = [r for r in results if not _is_logistic_base64(r)]
     login_instructions = _login_instruction_refinements(text, results)
     if any(detection_source(r) == SOURCE_NER and r.entity_type in _CREDENTIAL_ENTITY_TYPES for r in results):
         from recognizers.credential_rules import credential_reference_spans
         reference_spans = credential_reference_spans(text)
 
+    code_identifiers = None
     for result in results:
         source = detection_source(result)
         if not _valid_span(result, len(text)):
@@ -352,7 +513,7 @@ def merge_results(
             )
             continue
         if result.entity_type in _JOINED_NAME_TYPES:
-            trimmed = _skip_escape_letter(text, result)
+            trimmed = result if strings.at(result.start) else _skip_escape_letter(text, result)
             if trimmed is None:
                 decisions.append(MergeDecision("name_escape_letter_dropped", SOURCE_NONE, source))
                 continue
@@ -420,10 +581,13 @@ def merge_results(
             for other in results
             if other.entity_type != "ORGANIZATION" or detection_source(other) != SOURCE_NER
         ):
-            decisions.append(
-                MergeDecision("ner_identifier_fragment_suppressed", SOURCE_NONE, SOURCE_NER)
-            )
-            continue
+            if code_identifiers is None:
+                code_identifiers = _code_identifier_spans(text, strings)
+            if identifier in code_identifiers:
+                decisions.append(
+                    MergeDecision("ner_identifier_fragment_suppressed", SOURCE_NONE, SOURCE_NER)
+                )
+                continue
         if source == SOURCE_NER and result.entity_type == "CONTRACT_NUMBER":
             confirmed = any(
                 _spans_overlap(result.start, result.end, start, end)
@@ -486,6 +650,12 @@ def merge_results(
         text, valid_results, frozenset(sentence_starts), score_threshold
     )
     decisions.extend(name_decisions)
+    # Declared containers keep their span from the cascade even when the request
+    # excludes their class; they must not be reclassified as BASE64_DATA.
+    declared_containers = [
+        (r.start, r.end) for r in valid_results
+        if (r.recognition_metadata or {}).get("encoded_container") is True
+    ]
     if requested_entities:
         requested = frozenset(requested_entities)
         valid_results = [r for r in valid_results if r.entity_type in requested]
@@ -547,13 +717,19 @@ def merge_results(
         decisions.append(
             MergeDecision("overlap_fragment_kept", detection_source(fragment), SOURCE_NONE)
         )
-    kept, joined = _join_name_fragments(text, kept)
+    kept, joined = _join_name_fragments(text, kept, strings)
     decisions.extend(
         MergeDecision("name_fragments_joined", detection_source(r), detection_source(r))
         for r in joined
     )
 
     kept.sort(key=lambda result: (result.start, result.end, result.entity_type))
+    if logistic_results:
+        kept, added_decisions = _add_logistic_coverage(
+            text, kept, logistic_results, requested_entities, score_threshold,
+            declared_containers,
+        )
+        decisions.extend(added_decisions)
     return MergeOutcome(tuple(kept), tuple(decisions))
 
 
@@ -591,7 +767,12 @@ def _skip_escape_letter(text: str, result: RecognizerResult) -> RecognizerResult
     code string; a name that was only that letter is dropped.
     """
     start = result.start
-    if start > 0 and text[start - 1] == "\\" and text[start] in _ESCAPE_LETTERS:
+    backslashes = 0
+    cursor = start - 1
+    while cursor >= 0 and text[cursor] == "\\":
+        backslashes += 1
+        cursor -= 1
+    if backslashes % 2 and text[start] in _ESCAPE_LETTERS:
         start += 1
         if not any(character.isalnum() for character in text[start : result.end]):
             return None
@@ -602,6 +783,7 @@ def _skip_escape_letter(text: str, result: RecognizerResult) -> RecognizerResult
 def _join_name_fragments(
     text: str,
     kept: list[RecognizerResult],
+    strings: StringSpans,
 ) -> tuple[list[RecognizerResult], list[RecognizerResult]]:
     """Join same-type model names split by spaces, quotes or dashes; close edge quotes.
 
@@ -624,6 +806,7 @@ def _join_name_fragments(
             and _is_statistical(last)
             and _is_statistical(result)
             and last.end <= result.start
+            and strings.same_value(last.start, result.start)
             and _NAME_JOIN_GAP_RE.fullmatch(text[last.end : result.start])
         ):
             out[-1] = _copy_name(last, end=result.end, score=max(last.score, result.score))
@@ -638,6 +821,10 @@ def _join_name_fragments(
             initials = _TRAILING_INITIALS_RE.match(text, end)
             if initials is not None:
                 end = initials.end()
+        bounds = strings.align(start, end)
+        if bounds is None:
+            continue
+        start, end = bounds
         previous_end = out[index - 1].end if index > 0 else 0
         next_start = out[index + 1].start if index + 1 < len(out) else len(text)
         if (start, end) != (result.start, result.end) and start >= previous_end and end <= next_start:
@@ -692,14 +879,11 @@ def _token_has_other_detection(
 
 
 def _cut_code_identifier(text: str, start: int, end: int) -> tuple[int, int] | None:
-    """Return the Latin code identifier a span boundary falls inside, if any.
+    """Return a containing Latin identifier, without asserting that it is code.
 
-    A model organization that starts or ends in the middle of ``TensorFlow``,
-    ``UniSpeechSatForCTC`` or ``user_service`` is a fragment of a code symbol,
-    not a company name; masking it would also corrupt the identifier. Whole
-    words and Cyrillic text are never affected. The caller keeps the fragment
-    when any other detection touches the same run: a model may split a secret
-    into SECRET_KEY and ORGANIZATION pieces, and every piece must stay masked.
+    Shape only identifies a possible cut. The caller separately requires a
+    proven code-symbol span and keeps any run touched by another detection.
+    Whole words and Cyrillic text are never suppressed by this rule.
     """
     for inside, outside in ((start, start - 1), (end - 1, end)):
         if not 0 <= outside < len(text) or not start <= inside < end:
@@ -716,8 +900,128 @@ def _cut_code_identifier(text: str, start: int, end: int) -> tuple[int, int] | N
     return None
 
 
+def _code_identifier_spans(text: str, strings: StringSpans) -> set[tuple[int, int]]:
+    """Prove local symbol roles in valid Python and explicit Python fences.
+
+    A string value/comment, bare word, or an unrelated code block is not proof.
+    Parsing never evaluates source; invalid/unknown syntax conservatively keeps
+    the detection. Only targets, callable names, imports, declarations and
+    literal __all__ export entries are eligible, not arbitrary data expressions.
+    """
+    import ast
+    import tokenize
+
+    parts = [(0, text)]
+    for match in re.finditer(
+        r"(?m)^[ \t]*```(?:python|py)[ \t]*\r?\n(?P<code>[\s\S]*?)^[ \t]*```[ \t]*\r?$",
+        text,
+    ):
+        if strings.at(match.start()) is None:
+            parts.append((match.start("code"), match.group("code")))
+    spans = set()
+    for base, source in parts:
+        try:
+            tree = ast.parse(source)
+        except (SyntaxError, ValueError, RecursionError):
+            continue
+        # Python source lines use CR/LF, not every Unicode separator recognized
+        # by str.splitlines() (e.g. a form feed inside a string literal).
+        lines = re.findall(r"[^\r\n]*(?:\r\n|\r|\n|$)", source)
+        starts = [0]
+        for line in lines:
+            starts.append(starts[-1] + len(line))
+
+        byte_columns = {}
+
+        def offset(row, column, *, byte_column=False):
+            line = lines[row - 1]
+            if byte_column and not line.isascii():
+                if row not in byte_columns:
+                    mapping = {0: 0}
+                    byte_index = 0
+                    for char_index, char in enumerate(line, 1):
+                        byte_index += len(char.encode("utf-8"))
+                        mapping[byte_index] = char_index
+                    byte_columns[row] = mapping
+                column = byte_columns[row][column]
+            return starts[row - 1] + column
+
+        def bounds(node):
+            return (offset(node.lineno, node.col_offset, byte_column=True),
+                    offset(node.end_lineno, node.end_col_offset, byte_column=True))
+
+        roles = []
+        proved = set()
+        attribute_ends = set()
+
+        def callable_roles(node):
+            while isinstance(node, ast.Attribute):
+                # Do not include arguments of factory(secret).method().
+                attribute_ends.add(bounds(node)[1])
+                node = node.value
+            if isinstance(node, ast.Name):
+                roles.append(bounds(node))
+
+        nodes = list(ast.walk(tree))
+        bare_labels = {
+            id(node.target) for node in nodes
+            if isinstance(node, ast.AnnAssign) and node.value is None
+        }
+        for node in nodes:
+            if (isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store)
+                    and id(node) not in bare_labels):
+                roles.append(bounds(node))
+            elif isinstance(node, ast.Call):
+                callable_roles(node.func)
+            elif isinstance(node, (ast.Import, ast.ImportFrom)):
+                roles.append(bounds(node))
+            elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                start, _ = bounds(node)
+                header = re.compile(
+                    r"(?:async\s+)?(?:def|class)\s+(?P<name>" + re.escape(node.name) + r")\b"
+                ).match(source, start)
+                if header:
+                    roles.append(header.span("name"))
+            if isinstance(node, (ast.Assign, ast.AugAssign)):
+                targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+                if (any(isinstance(t, ast.Name) and t.id == "__all__" for t in targets)
+                        and isinstance(node.value, (ast.List, ast.Tuple, ast.Set))):
+                    for value in node.value.elts:
+                        if not (isinstance(value, ast.Constant) and isinstance(value.value, str)
+                                and value.value.isascii() and value.value.isidentifier()):
+                            continue
+                        left, right = bounds(value)
+                        index = bisect_left(strings.starts, base + left)
+                        if index < len(strings.spans):
+                            literal = strings.spans[index]
+                            if (literal.end <= base + right
+                                    and text[literal.content_start:literal.content_end] == value.value):
+                                proved.add((literal.content_start, literal.content_end))
+        roles.sort()
+        role_starts = [start for start, _ in roles]
+        role_ends = []
+        for _, end in roles:
+            role_ends.append(max(end, role_ends[-1] if role_ends else 0))
+        try:
+            reader = iter(lines)
+            for token in tokenize.generate_tokens(lambda: next(reader, "")):
+                if token.type != tokenize.NAME:
+                    continue
+                start = offset(*token.start)
+                end = offset(*token.end)
+                index = bisect_right(role_starts, start) - 1
+                if end in attribute_ends or (index >= 0 and end <= role_ends[index]):
+                    proved.add((base + start, base + end))
+        except (tokenize.TokenError, IndentationError):
+            # ast.parse already validated syntax; keep any uncertain names.
+            continue
+        spans.update(proved)
+    return spans
+
+
 def _recognizer_name(result: RecognizerResult) -> str:
-    return str((result.recognition_metadata or {}).get(RecognizerResult.RECOGNIZER_NAME_KEY, ""))
+    metadata = result.recognition_metadata or {}
+    return str(metadata.get("projected_recognizer_name", metadata.get(RecognizerResult.RECOGNIZER_NAME_KEY, "")))
 
 
 def _is_statistical(result: RecognizerResult) -> bool:
@@ -797,9 +1101,81 @@ def _uncovered_fragments(
                 end -= 1
             if start < end:
                 fragments.append(_copy_name(result, start=start, end=end))
-                covered[index:run_end] = b"\x01" * (run_end - index)
+                # Trimming or glued_right may shorten the uncovered run. Only
+                # the emitted span is covered; later eligible findings still
+                # need to see its unmasked remainder.
+                covered[start:end] = b"\x01" * (end - start)
             index = run_end
     return fragments
+
+
+def _is_logistic_base64(result: RecognizerResult) -> bool:
+    return (
+        result.entity_type == "BASE64_DATA"
+        and (result.recognition_metadata or {}).get("deterministic_rule_id")
+        == "base64.logistic-cascade"
+    )
+
+
+def _add_logistic_coverage(
+    text, native, candidates, requested_entities, score_threshold, declared_containers=(),
+):
+    """Union new Base64 ranges and subtract protected spans in one sorted sweep.
+
+    Protected spans are retained native results plus declared containers of any
+    class. Native results and types are unchanged. An intersecting container can
+    need several placeholders, whose saved values still restore the original text.
+    """
+    if requested_entities and "BASE64_DATA" not in requested_entities:
+        return native, []
+    ordered = sorted(
+        (r for r in candidates if _valid_span(r, len(text)) and r.score >= score_threshold),
+        key=lambda r: (r.start, r.end),
+    )
+    unions = []
+    for result in ordered:
+        if unions and result.start <= unions[-1].end:
+            previous = unions[-1]
+            unions[-1] = _copy_name(
+                previous, end=max(previous.end, result.end),
+                score=max(previous.score, result.score),
+            )
+        else:
+            unions.append(result)
+    protected = sorted(
+        [(r.start, r.end, detection_source(r)) for r in native]
+        + [(start, end, SOURCE_STRUCTURAL) for start, end in declared_containers]
+    )
+    additions = []
+    decisions = []
+    protected_index = 0
+    for result in unions:
+        cursor = result.start
+        while protected_index < len(protected) and protected[protected_index][1] <= cursor:
+            protected_index += 1
+        index = protected_index
+        while index < len(protected) and protected[index][0] < result.end:
+            start, end, source = protected[index]
+            if start > cursor:
+                additions.append(_copy_name(result, start=cursor, end=start))
+            cursor = max(cursor, end)
+            decisions.append(MergeDecision(
+                "base64_logistic_native_preserved", source, SOURCE_STRUCTURAL
+            ))
+            index += 1
+        if cursor < result.end:
+            additions.append(_copy_name(result, start=cursor))
+    # A remainder next to a native span must not start or end with a line break or spaces.
+    trimmed = []
+    for addition in additions:
+        start, end = addition.start, addition.end
+        while start < end and text[start].isspace():
+            start += 1
+        while end > start and text[end - 1].isspace():
+            end -= 1
+        if start < end:
+            trimmed.append(_copy_name(addition, start=start, end=end))
+    return sorted([*native, *trimmed], key=lambda r: (r.start, r.end, r.entity_type)), decisions
 
 
 def _copy_name(

@@ -1017,8 +1017,9 @@ def test_analysis_signature_is_stable_and_tracks_detection_configuration(
     assert analyzer_server._build_analysis_signature() != baseline
 
 
-def test_analysis_signature_tracks_registry_source_changes(monkeypatch):
-    source = Path(analyzer_server.__file__).resolve()
+@pytest.mark.parametrize("source_name", ["analyzer_server.py", "string_spans.py"])
+def test_analysis_signature_tracks_registry_source_changes(monkeypatch, source_name):
+    source = Path(analyzer_server.__file__).resolve().with_name(source_name)
     assert source in analyzer_server._analysis_source_files()
     baseline = analyzer_server._build_analysis_signature()
     read_bytes = Path.read_bytes
