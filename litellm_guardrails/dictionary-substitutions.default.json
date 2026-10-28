@@ -45,6 +45,83 @@
       "restore": true
     },
     {
+      "id": "alfabank_android_package_to_ladoga",
+      "enabled": true,
+      "source": "ru.alfabank.android",
+      "replacement": "ru.ladogafinance.android",
+      "match": {
+        "case_sensitive": true,
+        "whole_phrase": true
+      },
+      "restore": true
+    },
+    {
+      "id": "alfabank_npm_package_to_ladoga",
+      "enabled": true,
+      "source": "@alfa-bank/fms-types",
+      "replacement": "@ladoga-finance/fms-types",
+      "match": {
+        "case_sensitive": true,
+        "whole_phrase": true
+      },
+      "restore": true
+    },
+    {
+      "id": "alfabank_latin_to_ladoga_finance",
+      "enabled": true,
+      "source": "Alfa-Bank",
+      "replacement": "Ladoga Finance",
+      "match": {
+        "case_sensitive": true,
+        "whole_phrase": true
+      },
+      "restore": true
+    },
+    {
+      "id": "alfabank_token_lower_to_ladoga",
+      "enabled": true,
+      "source": "alfabank",
+      "replacement": "ladogafinance1",
+      "match": {
+        "case_sensitive": true,
+        "whole_phrase": false
+      },
+      "restore": true
+    },
+    {
+      "id": "alfabank_token_pascal_to_ladoga",
+      "enabled": true,
+      "source": "AlfaBank",
+      "replacement": "LadogaFinance2",
+      "match": {
+        "case_sensitive": true,
+        "whole_phrase": false
+      },
+      "restore": true
+    },
+    {
+      "id": "alfabank_token_upper_to_ladoga",
+      "enabled": true,
+      "source": "ALFABANK",
+      "replacement": "LADOGAFINANCE3",
+      "match": {
+        "case_sensitive": true,
+        "whole_phrase": false
+      },
+      "restore": true
+    },
+    {
+      "id": "alfabank_token_camel_to_ladoga",
+      "enabled": true,
+      "source": "alfaBank",
+      "replacement": "ladogaFinance4",
+      "match": {
+        "case_sensitive": true,
+        "whole_phrase": false
+      },
+      "restore": true
+    },
+    {
       "id": "psb_to_prizma_capital",
       "enabled": true,
       "source": "ПСБ",

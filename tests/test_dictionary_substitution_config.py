@@ -47,12 +47,19 @@ def test_default_dictionary_seed_contains_top_ten_bank_rules():
     )
     rules = config["substitutions"]
 
-    assert len(rules) == 10
+    assert len(rules) == 17
     assert [rule["source"] for rule in rules] == [
         "Сбербанк",
         "ВТБ",
         "Газпромбанк",
         "Альфа-Банк",
+        "ru.alfabank.android",
+        "@alfa-bank/fms-types",
+        "Alfa-Bank",
+        "alfabank",
+        "AlfaBank",
+        "ALFABANK",
+        "alfaBank",
         "ПСБ",
         "Россельхозбанк",
         "Т-Банк",
@@ -62,8 +69,8 @@ def test_default_dictionary_seed_contains_top_ten_bank_rules():
     ]
     assert all(rule["enabled"] is True for rule in rules)
     assert all(rule["restore"] is True for rule in rules)
-    assert len({rule["id"] for rule in rules}) == 10
-    assert len({rule["replacement"] for rule in rules}) == 10
+    assert len({rule["id"] for rule in rules}) == 17
+    assert len({rule["replacement"] for rule in rules}) == 17
 
 
 def test_dictionary_policy_is_documented_in_primary_docs():

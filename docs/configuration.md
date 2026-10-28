@@ -205,7 +205,7 @@ make up STACK=litellm-presidio ANALYZER_PROFILE=gpu
 | Переменная | Значение по умолчанию | Допустимые значения | На что влияет |
 | --- | --- | --- | --- |
 | `DICTIONARY_SUBSTITUTIONS_ENABLED` | `true` | `true`, `false` | Включает обратимые подстановки по точному совпадению до Presidio Analyzer. |
-| `DICTIONARY_SUBSTITUTIONS_FILE` | `/app/litellm_guardrails/dictionary-substitutions.default.json` | Путь к JSON-файлу | Файл правил подстановки. Базовый набор содержит 10 крупных российских банков. |
+| `DICTIONARY_SUBSTITUTIONS_FILE` | `/app/litellm_guardrails/dictionary-substitutions.default.json` | Путь к JSON-файлу | Файл правил подстановки. Базовый набор содержит 10 российских банков и 7 дополнительных вариантов Альфа-Банка (17 правил). |
 | `DICTIONARY_SUBSTITUTIONS_JSON` | Пусто | JSON-объект | Переопределение правил прямо в переменной окружения; если задано, используется вместо файла. |
 | `DICTIONARY_SUBSTITUTIONS_FAILURE_MODE` | `fail_closed` | `fail_closed`, `fail_open` | Поведение при некорректной конфигурации, неоднозначном запросе или ошибке Redis-сопоставления для слоя словарных подстановок. |
 

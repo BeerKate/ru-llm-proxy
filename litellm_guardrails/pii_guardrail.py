@@ -2837,12 +2837,23 @@ class RuPIIGuardrail(CustomGuardrail):
 
             if start < 0 or end > len(text) or start >= end:
                 continue
-            if self._span_overlaps_any(start, end, exclusion_spans or ()):
-                continue
-
             entity_type = self._normalize_entity_type(
                 str(entity.get("entity_type") or "PII")
             )
+            # A synthetic organization entirely inside a dictionary alias is
+            # already protected. Other entities, or a larger organization,
+            # must retain their complete native protection.
+            if entity_type == "ORGANIZATION" and any(
+                span_start <= start and end <= span_end
+                for span_start, span_end in exclusion_spans or ()
+            ):
+                continue
+            # Never cut an alias in half: its complete range is needed to
+            # restore a native mask back to the original, pre-dictionary value.
+            for span_start, span_end in exclusion_spans or ():
+                if start < span_end and end > span_start:
+                    start = min(start, span_start)
+                    end = max(end, span_end)
             normalized_entities.append((start, end, entity_type))
 
         if not normalized_entities:
@@ -2854,6 +2865,14 @@ class RuPIIGuardrail(CustomGuardrail):
         last_end = 0
         for start, end, entity_type in normalized_entities:
             if start < last_end:
+                if exclusion_spans:
+                    # Expansion can make native findings overlap. Retain the
+                    # full union instead of dropping the second finding's tail.
+                    previous_start, previous_end, previous_type = non_overlapping_entities[-1]
+                    last_end = max(previous_end, end)
+                    non_overlapping_entities[-1] = (
+                        previous_start, last_end, previous_type
+                    )
                 continue
             non_overlapping_entities.append((start, end, entity_type))
             last_end = end
@@ -3882,6 +3901,14 @@ class RuPIIGuardrail(CustomGuardrail):
                     exclusion_spans=dictionary_result.replacement_spans,
                 )
                 if mapping:
+                    # Store the original native value, before dictionary changes,
+                    # so atomic post-call/stream restoration needs only one pass.
+                    mapping = {
+                        placeholder: self._replace_placeholders(
+                            value, dictionary_result.mapping
+                        )
+                        for placeholder, value in mapping.items()
+                    }
                     pii_mapping.update(mapping)
                     pending_updates.append((target, field, content, masked_text))
                 elif provider_content != content:
