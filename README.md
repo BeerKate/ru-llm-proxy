@@ -9,14 +9,17 @@ LiteLLM с назначенными моделями, бюджетами и ог
 
 ## Статус проекта
 
-✅ В текущем `main` работают:
+Эта ветка содержит кандидат перехода на Tiny2/Triton из PR #109.
+Качество и промышленная ёмкость ещё не приняты; окончательное решение
+отслеживается в [#110](https://github.com/vovkins/ru-llm-proxy/issues/110).
+
+✅ Возможности реализации:
 
 - OpenAI-совместимый шлюз и базовые текстовые запросы Anthropic Messages API;
 - `glm-5.3-flash` по умолчанию и дополнительное имя `glm-5.3`;
 - пул из двух подписок Z.AI Coding Plan с закреплением клиентского ключа за
   выбранным провайдером модели;
-- распознаватели на регулярных выражениях, spaCy и специализированная BERT-модель;
-- отдельный NVIDIA CUDA-профиль Analyzer; CPU остаётся вариантом по умолчанию;
+- распознаватели на регулярных выражениях, облегчённый spaCy и Tiny2 через Triton/ONNX Runtime на CPU;
 - маскирование, блокировка, восстановление ответа и временные сопоставления в Redis;
 - восстановление потокового текста и JSON-аргументов инструментов в Chat Completions
   и Responses API, включая разорванные между событиями служебные метки;
@@ -74,41 +77,23 @@ make up STACK=litellm-presidio
 make health STACK=litellm-presidio
 ```
 
-По умолчанию запускается `TOPOLOGY=functional`: один LiteLLM и один Analyzer.
-`TOPOLOGY=production` включает CPU-пул из двух LiteLLM и четырёх Analyzer через
+По умолчанию запускается `TOPOLOGY=functional`: один LiteLLM, один Analyzer и один Triton.
+`TOPOLOGY=production` включает CPU-пул из двух LiteLLM, четырёх Analyzer и двух Triton через
 тот же Nginx. Выбор BLOCK/MASK, ресурсы и переключение описаны в
 [руководстве по развёртыванию](docs/deployment.md).
 
 Первая сборка скачивает `ru_core_news_sm` и закреплённую ревизию
-`fef2/ner_rus_bert-secret_detection`; веса BERT занимают около 709 МБ. Во время
-работы Analyzer читает модель из образа и не обращается к Hugging Face. Обычная
-сборка использует процессорный PyTorch и не содержит CUDA.
-
-Для Linux `x86_64` с NVIDIA GPU, драйвером и Container Toolkit доступен отдельный
-профиль:
-
-```bash
-make build ANALYZER_PROFILE=gpu
-make up STACK=litellm-presidio ANALYZER_PROFILE=gpu
-make health STACK=litellm-presidio ANALYZER_PROFILE=gpu
-```
-
-Он использует CUDA 12.6, требует драйвер не ниже 560.28.03 и compute capability
-7.5 или новее. При недоступной CUDA Analyzer не переходит на CPU, а явно
-отказывается запускаться.
-Результаты Tesla T4 и расчёт ресурсов приведены в
-[отчёте GPU-профиля](docs/research/gpu-analyzer-benchmark.md).
+`Katerina-Bir/rubert-tiny2-secret-detection`; веса занимают около 116 МБ. Во время
+работы обращения к Hugging Face нет. PyTorch используется только для экспорта
+при сборке; Analyzer выполняет токенизацию и правила, а Triton исполняет ONNX
+на CPU. GPU в этой версии не поддерживается. Контракт комплекта и ограничения:
+[Tiny2/Triton](docs/ner-triton.md).
 
 Расширенный состав добавляет пул ChatGPT OAuth-подписок через штатный
 `codex-lb`, не меняя обычный запуск с GLM. Его порядок запуска и
 администрирования описан в [руководстве по `codex-lb`](docs/codex-lb.md).
 
 ## Первый запрос
-
-Для наших весов Tiny2 доступен дополнительный CPU backend **Triton + ONNX Runtime**.
-Запуск и откат описаны в [руководстве Triton](docs/ner-triton.md).
-Обычный состав продолжает использовать Transformers/PyTorch.
-
 
 Создайте пользовательский ключ в административном интерфейсе LiteLLM или
 локальной командой:

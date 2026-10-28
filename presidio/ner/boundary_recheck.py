@@ -1,15 +1,15 @@
 """Bounded, opt-in negative evidence for truncated shell prompt detections."""
 from __future__ import annotations
 
-import os
 import re
 from typing import Any, Callable
 from .text_processing import NormalizedText
 
-RECHECK_ENV = "PRESIDIO_ANALYZER_NER_BOUNDARY_RECHECK"
 RECHECK_OFF = "off"
 RECHECK_SHELL_PROMPT = "shell-prompt"
-PROMPT = re.compile(r"(?i)^(?:bash|zsh|sh|fish)(?:[- ])?[$#>](?:\s+[^\r\n]*)?$")
+PROMPT = re.compile(
+    r"(?i)^(?:bash|zsh|sh|fish)(?P<edge>(?:[- ])?[$#>])(?:[ \t]+[^\r\n]*)?$"
+)
 CREDENTIAL_CONTEXT = re.compile(
     r"(?i)\b(?:password|passwd|pwd|credentials|secret_key|api_secret|"
     r"login|username|token|authorization|парол\w*|логин\w*)\b"
@@ -19,12 +19,11 @@ CREDENTIAL_TYPES = frozenset({"PASSWORD", "LOGIN", "AUTH_TOKEN", "SECRET_KEY"})
 
 
 def resolve_recheck(profile_name: str) -> str:
-    value = os.getenv(RECHECK_ENV, RECHECK_OFF).strip().lower()
-    if value not in {RECHECK_OFF, RECHECK_SHELL_PROMPT}:
-        raise ValueError("NER boundary recheck must be off or shell-prompt")
-    if value != RECHECK_OFF and profile_name != "tiny2":
-        raise ValueError("Shell prompt boundary recheck requires tiny2 profile")
-    return value
+    if profile_name != "tiny2":
+        raise ValueError("Unknown processing bundle")
+    # E5 did not establish a benefit: preserve E6's runtime default. The narrow
+    # algorithm remains independently testable, not an administrator env mode.
+    return RECHECK_OFF
 
 
 def prediction_key(prediction: Any) -> tuple[str, int, int, int]:
@@ -42,8 +41,17 @@ def eligible_prompt(text: str, start: int, end: int) -> bool:
     right = text.find("\n", end)
     if right < 0:
         right = len(text)
-    line = text[left:right].strip()
-    return len(line) <= 64 and PROMPT.fullmatch(line) is not None and not (
+    raw_line = text[left:right]
+    line = raw_line.strip()
+    match = PROMPT.fullmatch(line) if len(line) <= 64 else None
+    if match is None:
+        return False
+    line_start = left + len(raw_line) - len(raw_line.lstrip())
+    edge_start, edge_end = match.span("edge")
+    # A prompt-shaped line does not make punctuation in its arguments safe.
+    if not line_start + edge_start <= start < end <= line_start + edge_end:
+        return False
+    return not (
         CREDENTIAL_CONTEXT.search(text[max(0, left - 96):left])
         or CREDENTIAL_CONTEXT.search(text[max(0, left - 96):start])
     )

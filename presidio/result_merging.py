@@ -14,8 +14,6 @@ from string_spans import StringSpans
 
 DETECTION_SOURCE_METADATA_KEY = "ru_llm_detection_source"
 NER_MODEL_METADATA_KEY = "ru_llm_ner_model"
-# Set by a model profile whose subword names may stop inside a Latin word.
-NER_NAME_WORD_PIECES_KEY = "ru_llm_ner_name_word_pieces"
 
 SOURCE_NER = "ner"
 SOURCE_NATIVE_CREDENTIAL = "native_credential"
@@ -124,7 +122,6 @@ _ORG_GENERIC_LEAD_RE = re.compile(r"(?i)(?:организация|компани
 _ORG_TRAILING_PUNCTUATION = frozenset(".;,:")
 # A span that ends with an initial such as "И." keeps its period.
 _TRAILING_INITIAL_RE = re.compile(r"(?:^|(?<=[\s.]))[А-ЯЁA-Z]\.$")
-_LATIN_LETTERS = frozenset("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ")
 # One or two Cyrillic initials right after a surname: Петров И. С.
 _TRAILING_INITIALS_RE = re.compile(r"[ \t\u00a0]+[А-ЯЁ]\.(?:[ \t\u00a0]?[А-ЯЁ]\.)?(?![А-Яа-яЁё])")
 _IDENTIFIER_CHARACTERS = frozenset(
@@ -562,15 +559,6 @@ def merge_results(
                 )
             )
             continue
-        if (
-            source == SOURCE_NER
-            and result.entity_type in _JOINED_NAME_TYPES
-            and (result.recognition_metadata or {}).get(NER_NAME_WORD_PIECES_KEY) is True
-            and _cuts_latin_word(text, result.start, result.end)
-            and not _token_has_other_detection(text, result, results)
-        ):
-            decisions.append(MergeDecision("ner_word_piece_suppressed", SOURCE_NONE, SOURCE_NER))
-            continue
         identifier = (
             _cut_code_identifier(text, result.start, result.end)
             if source == SOURCE_NER and result.entity_type == "ORGANIZATION"
@@ -847,37 +835,6 @@ def _balance_name_quotes(text: str, start: int, end: int) -> tuple[int, int]:
     return start, end
 
 
-def _cuts_latin_word(text: str, start: int, end: int) -> bool:
-    """Whether a span starts or ends between two Latin letters (``Don|e``)."""
-    return (
-        (start > 0 and text[start - 1] in _LATIN_LETTERS and text[start] in _LATIN_LETTERS)
-        or (end < len(text) and text[end - 1] in _LATIN_LETTERS and text[end] in _LATIN_LETTERS)
-    )
-
-
-def _token_has_other_detection(
-    text: str,
-    result: RecognizerResult,
-    results: list[RecognizerResult],
-) -> bool:
-    """Whether a non-name detection touches the whitespace-delimited token.
-
-    A model may cover a secret or login with name pieces next to other
-    pieces; those must stay masked.
-    """
-    start, end = result.start, result.end
-    while start > 0 and not text[start - 1].isspace():
-        start -= 1
-    while end < len(text) and not text[end].isspace():
-        end += 1
-    return any(
-        other is not result
-        and other.entity_type not in _JOINED_NAME_TYPES
-        and _spans_overlap(other.start, other.end, start, end)
-        for other in results
-    )
-
-
 def _cut_code_identifier(text: str, start: int, end: int) -> tuple[int, int] | None:
     """Return a containing Latin identifier, without asserting that it is code.
 
@@ -1031,32 +988,6 @@ def _is_statistical(result: RecognizerResult) -> bool:
     )
 
 
-def _fragment_mode(
-    result: RecognizerResult,
-    kept: list[RecognizerResult],
-) -> str | None:
-    """Which characters of an overlapped result no winner covers may stay masked.
-
-    Additive address/passport rules complete what other detections leave
-    open. A model span keeps its whole remainder when every overlapping winner
-    is statistical too. Against a deterministic winner, which defines the value
-    boundaries, it keeps only a token glued to the right of a winner: a value
-    cut short at ``&`` continues there, while labels such as ``token=``,
-    ``Bearer`` or ``no.`` precede the value and stay visible.
-    """
-    if _recognizer_name(result) in _ADDITIVE_RECOGNIZERS:
-        return "remainder"
-    if detection_source(result) != SOURCE_NER:
-        return None
-    if all(
-        _is_statistical(winner)
-        for winner in kept
-        if _spans_overlap(result.start, result.end, winner.start, winner.end)
-    ):
-        return "remainder"
-    return "glued_right"
-
-
 def _uncovered_fragments(
     text: str,
     kept: list[RecognizerResult],
@@ -1068,15 +999,16 @@ def _uncovered_fragments(
     longer than the winner, so its other characters would reach the provider.
     Every overlapped result already passed the source filters above; each
     uncovered run keeps its type, score and metadata, trimmed of edge spaces.
+    NER and additive rules keep all their remaining coverage even when that
+    also masks a field label or ordinary words included by the model.
     """
-    modes = {id(r): _fragment_mode(r, kept) for r in overlapped}
-    overlapped = [r for r in overlapped if modes[id(r)] is not None]
+    overlapped = [r for r in overlapped if detection_source(r) == SOURCE_NER
+                  or _recognizer_name(r) in _ADDITIVE_RECOGNIZERS]
     if not overlapped:
         return []
     covered = bytearray(len(text))
     for result in kept:
         covered[result.start : result.end] = b"\x01" * (result.end - result.start)
-    winner_ends = {result.end for result in kept}
     fragments = []
     for result in sorted(overlapped, key=lambda r: (r.start, r.start - r.end)):
         index = result.start
@@ -1088,22 +1020,13 @@ def _uncovered_fragments(
             while run_end < result.end and not covered[run_end]:
                 run_end += 1
             start, end = index, run_end
-            if modes[id(result)] == "glued_right":
-                if start not in winner_ends or text[start].isspace():
-                    index = run_end
-                    continue
-                end = start
-                while end < run_end and not text[end].isspace():
-                    end += 1
             while start < end and text[start].isspace():
                 start += 1
             while end > start and text[end - 1].isspace():
                 end -= 1
             if start < end:
                 fragments.append(_copy_name(result, start=start, end=end))
-                # Trimming or glued_right may shorten the uncovered run. Only
-                # the emitted span is covered; later eligible findings still
-                # need to see its unmasked remainder.
+                # Mark only emitted coverage, not the trimmed edge whitespace.
                 covered[start:end] = b"\x01" * (end - start)
             index = run_end
     return fragments

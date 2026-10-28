@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 import urllib.error
 import urllib.request
@@ -15,6 +16,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from presidio.evaluation.corpus import DEFAULT_CORPUS_PATH, load_corpus
 from presidio.evaluation.metrics import evaluate_predictions
 from presidio.evaluation.run_baseline import AnalyzerClient
+from tests.e2e.ner_test_support import run_checks, write_report
 
 CORPUS = DEFAULT_CORPUS_PATH.with_name("instruction_regressions.jsonl")
 NAME_CORPUS = DEFAULT_CORPUS_PATH.with_name("person_organization_regressions.jsonl")
@@ -498,25 +500,28 @@ def main():
         (args.analyzer_url, args.proxy_url, args.block_proxy_url, args.capture_url)
     ):
         parser.error("Analyzer, mask/block proxy and capture URLs are required")
-    check_dialogue_arguments(args.proxy_url, args.block_proxy_url, args.capture_url)
-    check_instructions(args.analyzer_url, args.proxy_url, args.block_proxy_url, args.capture_url)
-    check_names(
-        args.analyzer_url, args.proxy_url, args.block_proxy_url, args.capture_url
-    )
-    check_names(
-        args.analyzer_url,
-        args.proxy_url,
-        args.block_proxy_url,
-        args.capture_url,
-        context=True,
-    )
-    check_names(
-        args.analyzer_url,
-        args.proxy_url,
-        args.block_proxy_url,
-        args.capture_url,
-        field_holdout=True,
-    )
+    urls = (args.analyzer_url, args.proxy_url, args.block_proxy_url, args.capture_url)
+    checks = [
+        ("dialogue-arguments", lambda: check_dialogue_arguments(*urls[1:])),
+        ("instructions", lambda: check_instructions(*urls)),
+        ("names", lambda: check_names(*urls)),
+        ("name-context", lambda: check_names(*urls, context=True)),
+        ("name-holdout", lambda: check_names(*urls, field_holdout=True)),
+    ]
+    cases = (*load_corpus(CORPUS), *_name_cases(), *_context_cases(), *_field_holdout_cases())
+    policy = os.environ.get("PRESIDIO_ANALYZER_BASE64_POLICY", "content")
+    if policy not in {"content", "logistic"}:
+        parser.error("Unsupported Base64 policy")
+    folder = os.environ.get("NER_TEST_REPORT_DIR")
+    report = {"status": "running", "base64_policy": policy, "checks": []}
+    try:
+        run_checks(checks, report["checks"], case_ids=[case.case_id for case in cases])
+        report["status"] = "passed"
+    except BaseException:
+        report["status"] = "failed"
+        raise
+    finally:
+        write_report(Path(folder) / f"instructions-{policy}.json" if folder else None, report)
 
 
 if __name__ == "__main__":

@@ -37,11 +37,10 @@ Thumbs.db
 # Docker
 docker-compose.override.yml
 
-# NER models (downloaded at setup)
+# Generated NER artifacts (model acquisition happens at build time).
 models/
-# Local model weights for the image build; only the README is tracked.
-presidio/model-artifacts/*/*
-!presidio/model-artifacts/*/README.md
+*.safetensors
+*.onnx
 *.bin
 *.gguf
 
@@ -61,10 +60,12 @@ presidio/evaluation/data/*
 !presidio/evaluation/data/name_field_holdout.jsonl
 !presidio/evaluation/data/name_field_header_control.jsonl
 !presidio/evaluation/data/deterministic_rules_review.jsonl
+!presidio/evaluation/data/tiny2_component_study.jsonl
 pgdata/
 cache/
 
 # Testing
+/tmp/ner-integration/
 .pytest_cache/
 .coverage
 htmlcov/

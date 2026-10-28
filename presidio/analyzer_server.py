@@ -27,16 +27,20 @@ from entity_types import NER_ENTITY_TYPES
 from recognizers import ALL_RECOGNIZERS
 from recognizers.base64_data import Base64DataRecognizer
 from result_merging import MergeDecision, merge_results
+from onnx_artifact import EXPORT_MANIFEST_PATH
 from text_chunking import TextChunk, plan_text_chunks
 from ner import (
     ACTIVE_PROFILE,
     MODEL_ID,
     MODEL_REVISION,
-    HuggingFaceNERRecognizer,
+    TritonNERRecognizer,
     NERBackendError,
     NERInferenceCancelled,
     NERInferenceTelemetry,
     NERProcessingError,
+)
+from ner.work_budget import (
+    BUDGET_HEADER, CURRENT_BUDGET, check_work, parse_budget, remaining_seconds, work_scope,
 )
 
 logging.basicConfig(level=logging.INFO)
@@ -262,43 +266,13 @@ ANALYZER_RUNTIME_INFO = _build_metric(
     Gauge,
     "ru_presidio_analyzer_runtime_info",
     "Static Analyzer NER runtime information.",
-    ["profile", "precision", "compute_capability"],
-)
-ANALYZER_GPU_MEMORY_TOTAL = _build_metric(
-    Gauge,
-    "ru_presidio_analyzer_gpu_memory_total_bytes",
-    "Total memory of the selected CUDA device, or zero for CPU.",
-)
-ANALYZER_GPU_MEMORY_ALLOCATED = _build_metric(
-    Gauge,
-    "ru_presidio_analyzer_gpu_memory_allocated_bytes",
-    "Current PyTorch memory allocated on the selected CUDA device.",
-)
-ANALYZER_GPU_MEMORY_RESERVED = _build_metric(
-    Gauge,
-    "ru_presidio_analyzer_gpu_memory_reserved_bytes",
-    "Current PyTorch memory reserved on the selected CUDA device.",
-)
-ANALYZER_GPU_MEMORY_PEAK = _build_metric(
-    Gauge,
-    "ru_presidio_analyzer_gpu_memory_peak_allocated_bytes",
-    "Peak PyTorch memory allocated on the selected CUDA device.",
+    ["profile", "precision", "backend"],
 )
 
 ANALYZER_REQUEST_ID_HEADER = "X-Ru-LLM-Request-ID"
 ANALYZER_TEXT_FIELD_INDEX_HEADER = "X-Ru-LLM-Text-Field-Index"
 ANALYSIS_SIGNATURE_SCHEMA = "ru-llm-proxy-analyzer-v1"
 ANALYSIS_SIGNATURE_ENV_NAMES = (
-    "PRESIDIO_ANALYZER_NER_BOUNDARY_RECHECK",
-    "PRESIDIO_ANALYZER_NER_BACKEND",
-    "PRESIDIO_ANALYZER_TRITON_URL",
-    "PRESIDIO_ANALYZER_TRITON_MODEL_NAME",
-    "PRESIDIO_ANALYZER_TRITON_MODEL_VERSION",
-    "PRESIDIO_ANALYZER_NER_MODEL_PROFILE",
-    "PRESIDIO_ANALYZER_NER_O_LOGIT_BIAS",
-    "PRESIDIO_ANALYZER_NER_SPAN_POSTPROCESSING",
-    "PRESIDIO_ANALYZER_DEVICE_PROFILE",
-    "PRESIDIO_ANALYZER_GPU_PRECISION",
     "PRESIDIO_ANALYZER_NER_BATCH_SIZE",
     "PRESIDIO_ANALYZER_DETECT_BARE_INN_BY_CHECKSUM",
     "PRESIDIO_ANALYZER_DETECT_PUBLIC_IPS",
@@ -311,8 +285,8 @@ ANALYSIS_SIGNATURE_DISTRIBUTIONS = (
     "pymorphy3-dicts-ru",
     "ru-core-news-sm",
     "spacy",
-    "torch",
-    "transformers",
+    "tokenizers",
+    "numpy",
 )
 _ANALYZER_CORRELATION_CONTEXT: ContextVar[dict[str, str | int]] = ContextVar(
     "ru_llm_proxy_analyzer_correlation",
@@ -342,6 +316,8 @@ def _analysis_source_files() -> tuple[Path, ...]:
         root / "result_merging.py",
         root / "string_spans.py",
         root / "text_chunking.py",
+        root / "model_contract.py",
+        root / "onnx_artifact.py",
     ]
     for directory in (root / "ner", root / "recognizers"):
         files.extend(sorted(directory.glob("*.py")))
@@ -367,6 +343,10 @@ def _build_analysis_signature() -> str:
     payload = {
         "schema": ANALYSIS_SIGNATURE_SCHEMA,
         "model": {"id": MODEL_ID, "revision": MODEL_REVISION},
+        "trusted_export_sha256": (
+            hashlib.sha256(EXPORT_MANIFEST_PATH.read_bytes()).hexdigest()
+            if EXPORT_MANIFEST_PATH.is_file() else "not-installed"
+        ),
         "distributions": {
             name: _distribution_version(name)
             for name in ANALYSIS_SIGNATURE_DISTRIBUTIONS
@@ -403,9 +383,8 @@ async def lifespan(_app: FastAPI):
         ANALYZER_RUNTIME_INFO.labels(
             profile=runtime["profile"],
             precision=runtime["precision"],
-            compute_capability=runtime["compute_capability"] or "none",
+            backend=runtime["backend"],
         ).set(1)
-        ANALYZER_GPU_MEMORY_TOTAL.set(runtime["gpu_memory_total_bytes"])
         _safe_log(
             logging.INFO,
             "presidio_ner_startup_ready",
@@ -416,10 +395,6 @@ async def lifespan(_app: FastAPI):
             device_profile=runtime["profile"],
             device=runtime["device"],
             precision=runtime["precision"],
-            device_name=runtime["device_name"] or "none",
-            compute_capability=runtime["compute_capability"] or "none",
-            cuda_version=runtime["cuda_version"] or "none",
-            gpu_memory_total_bytes=runtime["gpu_memory_total_bytes"],
             inference_batch_size=runtime["inference_batch_size"],
             model_profile=runtime.get("model_profile", "unknown"),
             o_logit_bias=runtime.get("o_logit_bias", 0.0),
@@ -442,10 +417,13 @@ async def lifespan(_app: FastAPI):
             revision=MODEL_REVISION,
         )
         raise RuntimeError(
-            "Hugging Face NER is required but failed to load. "
+            "CPU Triton NER is required but failed to load. "
             "Refusing to start Presidio Analyzer."
         ) from None
-    yield
+    try:
+        yield
+    finally:
+        await asyncio.to_thread(ner_recognizer.close)
 
 
 app = FastAPI(title="Presidio Analyzer (ru-llm-proxy)", lifespan=lifespan)
@@ -483,23 +461,31 @@ for recognizer_cls in ALL_RECOGNIZERS:
     analyzer.registry.add_recognizer(recognizer)
     logger.info(f"Registered recognizer: {recognizer.name}")
 
-# Initialize the one fixed Hugging Face NER backend.
-ner_recognizer = HuggingFaceNERRecognizer()
+# Initialize the required CPU Triton recognizer.
+ner_recognizer = TritonNERRecognizer()
 capacity_limiter = build_limiter_from_env()
+_HEALTH_PROBE_LOCK = asyncio.Lock()
 ANALYZER_CAPACITY_ACTIVE.set_function(
     lambda: capacity_limiter.snapshot()["active"]
 )
 ANALYZER_CAPACITY_WAITING.set_function(
     lambda: capacity_limiter.snapshot()["waiting"]
 )
-ANALYZER_GPU_MEMORY_ALLOCATED.set_function(
-    ner_recognizer.gpu_memory_allocated_bytes
+ANALYZER_TRITON_INFLIGHT = _build_metric(
+    Gauge, "ru_presidio_triton_local_inflight",
+    "Active local inference calls; does not include unknown remote work after connection loss.",
 )
-ANALYZER_GPU_MEMORY_RESERVED.set_function(
-    ner_recognizer.gpu_memory_reserved_bytes
+ANALYZER_TRITON_INFLIGHT.set_function(lambda: ner_recognizer.transport_snapshot()["local_inflight"])
+ANALYZER_NER_READY = _build_metric(
+    Gauge, "ru_presidio_ner_ready", "Cached mandatory NER readiness; collection performs no network I/O.",
 )
-ANALYZER_GPU_MEMORY_PEAK.set_function(
-    ner_recognizer.gpu_peak_memory_allocated_bytes
+ANALYZER_NER_READY.set_function(lambda: int(ner_recognizer.state() == "ready"))
+ANALYZER_TRITON_UNCONFIRMED = _build_metric(
+    Gauge, "ru_presidio_triton_unconfirmed_completions",
+    "Inference calls with unknown remote completion observed since start, not current remote concurrency.",
+)
+ANALYZER_TRITON_UNCONFIRMED.set_function(
+    lambda: ner_recognizer.transport_snapshot()["inference_completion_unconfirmed_total"]
 )
 
 
@@ -550,7 +536,9 @@ async def health():
     if runtime.get('backend') == 'triton':
         # Probe remote readiness before serving a healthy cache signature. Keep
         # blocking HTTP off the API event loop, including on the first outage.
-        await asyncio.to_thread(ner_recognizer.is_ready)
+        if not _HEALTH_PROBE_LOCK.locked():
+            async with _HEALTH_PROBE_LOCK:
+                await asyncio.to_thread(ner_recognizer.is_ready)
     ner_status = "loaded" if ner_recognizer.is_loaded() else "not_loaded"
     ner_warmed_up = ner_recognizer.is_warmed_up()
     ner_state = ner_recognizer.state()
@@ -560,32 +548,24 @@ async def health():
         "ner_state": ner_state,
         "ner_warmed_up": ner_warmed_up,
         "ner_required": True,
-        "ner_backend": "triton_onnxruntime" if runtime.get('backend') == 'triton' else "huggingface_transformers",
+        "ner_backend": "triton_onnxruntime",
         "ner_model": MODEL_ID,
         "ner_revision": MODEL_REVISION,
+        "ner_onnx_sha256": runtime.get("onnx_sha256"),
         "ner_device_profile": runtime["profile"],
         "ner_device": runtime["device"],
         "ner_precision": runtime["precision"],
         "ner_inference_batch_size": runtime["inference_batch_size"],
         "analysis_signature": ANALYSIS_SIGNATURE,
         "capacity": capacity_limiter.snapshot(),
+        "triton_transport": ner_recognizer.transport_snapshot(),
     }
-    if runtime["device_name"] is not None:
-        payload["ner_device_name"] = runtime["device_name"]
-    if runtime["compute_capability"] is not None:
-        payload["ner_compute_capability"] = runtime["compute_capability"]
-    if runtime["cuda_version"] is not None:
-        payload["ner_cuda_version"] = runtime["cuda_version"]
-    if runtime["gpu_memory_total_bytes"]:
-        payload["ner_gpu_memory_total_bytes"] = runtime[
-            "gpu_memory_total_bytes"
-        ]
     if ner_recognizer.failure_phase() is not None:
         payload["ner_failure_phase"] = ner_recognizer.failure_phase()
     if ner_recognizer.failure_class() is not None:
         payload["ner_failure_class"] = ner_recognizer.failure_class()
     if ner_state != "ready":
-        return JSONResponse(status_code=503, content=payload)
+        return JSONResponse(status_code=503, content=payload, headers={"Retry-After": "5"})
     return payload
 
 
@@ -608,6 +588,7 @@ async def analyze(
         alias=ANALYZER_TEXT_FIELD_INDEX_HEADER,
     ),
     http_request: Request = None,
+    analysis_budget_header: str | None = Header(default=None, alias=BUDGET_HEADER),
 ):
     """Analyze one text field with optional validated internal correlation."""
     correlation = _validate_analyzer_correlation(
@@ -616,15 +597,21 @@ async def analyze(
     )
     context_token = _ANALYZER_CORRELATION_CONTEXT.set(correlation)
     try:
-        if http_request is None:
-            return await _analyze_with_capacity(request)
         try:
-            return await _analyze_until_disconnect(
-                request,
-                http_request.is_disconnected,
-            )
-        except AnalyzerClientDisconnected:
-            return Response(status_code=499)
+            seconds = parse_budget(analysis_budget_header if isinstance(analysis_budget_header, str)
+                                   else os.getenv("PII_GUARDRAIL_ANALYZER_TIMEOUT_SECONDS", "240"))
+        except (ValueError, TypeError):
+            raise HTTPException(status_code=422, detail="invalid analysis time budget") from None
+        with work_scope(seconds=seconds):
+            if http_request is None:
+                return await _analyze_with_capacity(request)
+            try:
+                return await _analyze_until_disconnect(
+                    request,
+                    http_request.is_disconnected,
+                )
+            except AnalyzerClientDisconnected:
+                return Response(status_code=499)
     finally:
         _ANALYZER_CORRELATION_CONTEXT.reset(context_token)
 
@@ -657,12 +644,30 @@ async def _analyze_until_disconnect(
 
 
 async def _analyze_with_capacity(request: AnalyzeRequest) -> AnalyzeResponse:
+    started_at = time.perf_counter()
+    seconds = None if CURRENT_BUDGET.get() is not None else parse_budget(
+        os.getenv("PII_GUARDRAIL_ANALYZER_TIMEOUT_SECONDS", "240"))
+    try:
+        with work_scope(seconds=seconds):
+            return await _analyze_with_capacity_budgeted(request)
+    except NERBackendError as error:
+        _emit_analyzer_telemetry(request=request, started_at=started_at,
+            outcome="analyzer_error", failure_reason="required_ner_unavailable",
+            ner_failure_phase=error.phase, ner_failure_class=error.failure_class)
+        raise HTTPException(status_code=503, detail={"code": "required_ner_unavailable",
+            "phase": error.phase, "failure_class": error.failure_class,
+            "retryable": False}) from None
+
+
+async def _analyze_with_capacity_budgeted(request: AnalyzeRequest) -> AnalyzeResponse:
     """Apply bounded queueing and execute one Analyzer request."""
     started_at = time.perf_counter()
     queue_started_at = time.perf_counter()
     try:
-        slot = await capacity_limiter.acquire()
+        check_work()
+        slot = await capacity_limiter.acquire(timeout_seconds=remaining_seconds())
     except CapacityRejected as e:
+        check_work()
         queue_wait_seconds = time.perf_counter() - queue_started_at
         _record_queue_wait(e.reason, queue_wait_seconds)
         _emit_analyzer_telemetry(
@@ -687,7 +692,9 @@ async def _analyze_with_capacity(request: AnalyzeRequest) -> AnalyzeResponse:
     _record_queue_wait("acquired", queue_wait_seconds)
     try:
         async with slot:
+            check_work()
             response = await _run_blocking_analyze(request)
+            check_work()
     except asyncio.CancelledError:
         _emit_analyzer_telemetry(
             request=request,
@@ -713,7 +720,12 @@ async def _analyze_with_capacity(request: AnalyzeRequest) -> AnalyzeResponse:
                 "code": "required_ner_unavailable",
                 "phase": e.phase,
                 "failure_class": e.failure_class,
+                **({"retryable": False} if e.failure_class in {
+                    "analysis_deadline_exceeded", "triton_contract_invalid"} else {}),
             },
+            headers=({"Retry-After": "5"} if e.failure_class == "triton_unavailable" else
+                     {"Retry-After": str(capacity_limiter.retry_after_seconds)}
+                     if e.failure_class == "triton_overloaded" else None),
         ) from None
     except Exception as e:
         _emit_analyzer_telemetry(
@@ -741,7 +753,8 @@ async def _run_blocking_analyze(request: AnalyzeRequest) -> AnalyzeResponse:
     cancellation_event = threading.Event()
     context_token = _ANALYZER_CANCELLATION_CONTEXT.set(cancellation_event)
     try:
-        task = asyncio.create_task(asyncio.to_thread(_analyze_sync, request))
+        with work_scope(cancellation=cancellation_event):
+            task = asyncio.create_task(asyncio.to_thread(_analyze_sync, request))
     finally:
         _ANALYZER_CANCELLATION_CONTEXT.reset(context_token)
     cancelled = False
@@ -1001,6 +1014,7 @@ def _analyze_sync(request: AnalyzeRequest) -> AnalyzeResponse:
 
 
 def _raise_if_cancelled(cancellation_event: threading.Event | None) -> None:
+    check_work()
     """Stop bounded worker work at the next safe chunk or batch boundary."""
     if cancellation_event is not None and cancellation_event.is_set():
         raise AnalyzerWorkCancelled("Analyzer request was cancelled")

@@ -1,16 +1,17 @@
 """Verify immutable ONNX bytes, generate bounded CPU config, run Triton."""
 import hashlib
-import json
 import os
 from pathlib import Path
 import re
 
+from onnx_artifact import load_export_manifest
+from model_artifact import load_manifest
+
 
 def configure(root=Path('/models')):
     directory = root / 'tiny2'
-    manifest = json.loads((directory / 'export-manifest.json').read_text())
-    if manifest.get('schema_version') != 1 or manifest.get('precision') != 'fp32' or manifest.get('model_profile') != 'tiny2':
-        raise ValueError('Invalid export manifest')
+    source = load_manifest(Path(__file__).with_name('model_manifest.json'))
+    manifest = load_export_manifest(directory / 'export-manifest.json', source)
     graph = directory / '1/model.onnx'
     digest = hashlib.sha256()
     with graph.open('rb') as stream:
@@ -18,7 +19,7 @@ def configure(root=Path('/models')):
             digest.update(block)
     if digest.hexdigest() != manifest.get('onnx_sha256'):
         raise ValueError('ONNX checksum mismatch')
-    instances = int(os.getenv('TRITON_MODEL_INSTANCES', '1'))
+    instances = int(os.getenv('TRITON_MODEL_INSTANCES', '2'))
     if not 1 <= instances <= 32:
         raise ValueError('TRITON_MODEL_INSTANCES must be between 1 and 32')
     parameters = []
@@ -34,15 +35,23 @@ backend: "onnxruntime"
 max_batch_size: 32
 version_policy { specific { versions: [1] } }
 input [
- { name: "input_ids" data_type: TYPE_INT64 dims: [-1] },
- { name: "attention_mask" data_type: TYPE_INT64 dims: [-1] },
- { name: "token_type_ids" data_type: TYPE_INT64 dims: [-1] }
+ { name: "input_ids" data_type: TYPE_INT64 dims: [386] },
+ { name: "attention_mask" data_type: TYPE_INT64 dims: [386] },
+ { name: "token_type_ids" data_type: TYPE_INT64 dims: [386] }
 ]
-output [ { name: "logits" data_type: TYPE_FP32 dims: [-1, 17] } ]
+output [ { name: "logits" data_type: TYPE_FP32 dims: [386, 17] } ]
 parameters { key: "intra_op_thread_count" value: { string_value: "1" } }
 parameters { key: "inter_op_thread_count" value: { string_value: "1" } }
 parameters { key: "execution_mode" value: { string_value: "0" } }
-dynamic_batching { max_queue_delay_microseconds: 1000 }
+dynamic_batching {
+ max_queue_delay_microseconds: 1000
+ default_queue_policy {
+  timeout_action: REJECT
+  default_timeout_microseconds: 60000000
+  max_queue_size: 64
+  allow_timeout_override: true
+ }
+}
 '''
     config += f'instance_group [ {{ count: {instances} kind: KIND_CPU }} ]\n'
     (directory / 'config.pbtxt').write_text(config + '\n'.join(parameters) + '\n')

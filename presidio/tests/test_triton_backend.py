@@ -1,21 +1,22 @@
 """Transport, identity and safe-failure checks for the optional Triton backend."""
 import json
+from dataclasses import replace
 from types import SimpleNamespace
 
 import httpx
 import numpy as np
 import pytest
-import torch
 
 from presidio.model_artifact import ModelFile, ModelManifest
 from presidio.model_profiles import PROFILES
 from presidio.ner.backend_settings import BackendSettings, resolve_backend
-from presidio.ner.huggingface_recognizer import (
-    EXPECTED_ID2LABEL, HuggingFaceNERRecognizer, NERConfigurationError, NERUnavailableError)
+from presidio.ner.triton_recognizer import (
+    EXPECTED_ID2LABEL, TritonNERRecognizer, NERConfigurationError, NERUnavailableError)
 from presidio.ner.triton_model import TritonModel, label_digest
+from presidio.model_contract import INPUT_NAMES, MODEL_ID, MODEL_REVISION, MODEL_VARIANT
 
 
-def fixture_model(handler_change=None):
+def fixture_model(handler_change=None, remote_change=None):
     manifest = ModelManifest(PROFILES['tiny2'].model_id, PROFILES['tiny2'].revision,
         'BertForTokenClassification', 'test', 'test', (
             ModelFile('model.safetensors', 1, 'a' * 64),
@@ -26,13 +27,18 @@ def fixture_model(handler_change=None):
               'model_profile': 'tiny2', 'onnx_sha256': 'c' * 64}
     remote = {'backend': 'onnxruntime', 'max_batch_size': 32,
               'parameters': {key: {'string_value': value} for key, value in params.items()},
-              'input': [{'name': name, 'data_type': 'TYPE_INT64', 'dims': [-1]} for name in
+              'input': [{'name': name, 'data_type': 'TYPE_INT64', 'dims': [386]} for name in
                         ['input_ids', 'attention_mask', 'token_type_ids']],
-              'output': [{'name': 'logits', 'data_type': 'TYPE_FP32', 'dims': [-1, 17]}],
+              'output': [{'name': 'logits', 'data_type': 'TYPE_FP32', 'dims': [386, 17]}],
               'instance_group': [{'kind': 'KIND_CPU'}]}
-    state = {'ready': True, 'remote': remote, 'last_inputs': None}
+    if remote_change:
+        remote_change(remote)
+    state = {'ready': True, 'remote': remote, 'last_inputs': None, 'requests': [], 'response': None}
 
     def handle(request):
+        state['requests'].append(request)
+        if state['response'] is not None:
+            return state['response'](request)
         if request.url.path.endswith('/ready'):
             return httpx.Response(200 if state['ready'] else 503)
         if request.url.path.endswith('/config'):
@@ -53,12 +59,20 @@ def fixture_model(handler_change=None):
         return httpx.Response(200, content=encoded + data,
                               headers={'Inference-Header-Content-Length': str(len(encoded))})
     client = httpx.Client(transport=httpx.MockTransport(handle))
-    model = TritonModel(BackendSettings(backend='triton', url='http://test'), manifest, config, client)
+    trusted = dict(schema_version=2, model_profile='tiny2', precision='fp32',
+        source_model_id=MODEL_ID, source_revision=MODEL_REVISION, source_variant=MODEL_VARIANT,
+        source_model_sha256='a'*64, tokenizer_sha256='b'*64, onnx_sha256='c'*64,
+        label_contract_sha256=label_digest(EXPECTED_ID2LABEL), sequence_length=386,
+        max_batch_size=32, input_names=list(INPUT_NAMES), opset=17,
+        source_files=[dict(path=f.path, size=f.size, sha256=f.sha256) for f in manifest.files],
+        versions={name:'test' for name in ('python','torch','transformers','onnx','onnxruntime','tokenizers')})
+    model = TritonModel(BackendSettings(backend='triton', url='http://test'), manifest,
+                        config, client, export_manifest=trusted)
     return model, state
 
 
-def test_default_backend_is_transformers():
-    assert resolve_backend({}).backend == 'transformers'
+def test_default_backend_is_triton():
+    assert resolve_backend({}).backend == 'triton'
 
 
 @pytest.mark.parametrize('changes', [
@@ -75,12 +89,12 @@ def test_reject_invalid_backend_settings(changes):
 
 def test_binary_transport_preserves_shapes_and_logits():
     model, state = fixture_model()
-    inputs = {name: torch.zeros((2, 386), dtype=torch.long) for name in
+    inputs = {name: np.zeros((2, 386), dtype=np.int64) for name in
               ['input_ids', 'attention_mask', 'token_type_ids']}
     result = model(**inputs).logits
     assert tuple(result.shape) == (2, 386, 17)
-    assert result.dtype == torch.float32
-    assert torch.all(result[..., 0] == 5)
+    assert result.dtype == np.float32
+    assert np.all(result[..., 0] == 5)
     assert state['last_inputs']['inputs'][0]['parameters']['binary_data_size'] == 2 * 386 * 8
 
 
@@ -94,6 +108,14 @@ def test_ready_rejects_remote_contract_changes(alteration):
                'labels': 'label_contract_sha256', 'graph': 'onnx_sha256'}[alteration]
         state['remote']['parameters'][key]['string_value'] = 'd' * 64
     assert not model.ready()
+
+
+def test_first_server_graph_must_match_build_produced_metadata():
+    def wrong_graph(remote):
+        remote['parameters']['onnx_sha256']['string_value'] = 'd' * 64
+
+    with pytest.raises(NERConfigurationError, match='identity'):
+        fixture_model(remote_change=wrong_graph)
 
 
 @pytest.mark.parametrize('alteration', ['shape', 'dtype', 'name', 'version', 'short', 'nan'])
@@ -111,42 +133,34 @@ def test_bad_response_fails_closed(alteration):
             out['outputs'][0]['datatype'] = 'FP16'
         return out, data
     model, _ = fixture_model(change)
-    inputs = {name: torch.zeros((1, 386), dtype=torch.long) for name in
+    inputs = {name: np.zeros((1, 386), dtype=np.int64) for name in
               ['input_ids', 'attention_mask', 'token_type_ids']}
     with pytest.raises(NERUnavailableError) as error:
         model(**inputs)
-    assert error.value.failure_class == 'triton_inference_failed'
+    assert error.value.failure_class == 'triton_contract_invalid'
 
 
-def test_triton_requires_tiny2_and_cpu(monkeypatch):
-    monkeypatch.setenv('PRESIDIO_ANALYZER_NER_BACKEND', 'triton')
-    with pytest.raises(ValueError, match='tiny2 and CPU'):
-        HuggingFaceNERRecognizer(profile=PROFILES['bert'])
-    with pytest.raises(ValueError, match='tiny2 and CPU'):
-        HuggingFaceNERRecognizer(profile=PROFILES['tiny2'], device_profile='gpu')
+def test_local_execution_is_not_a_supported_backend():
+    with pytest.raises(ValueError, match="obsolete NER settings"):
+        resolve_backend({"PRESIDIO_ANALYZER_NER_BACKEND": "transformers"})
 
 
-def test_local_model_loader_is_not_used_for_triton(monkeypatch, tmp_path):
-    import transformers
-    from presidio.ner import huggingface_recognizer as module
+def test_loader_uses_only_verified_tokenizer_and_triton(monkeypatch, tmp_path):
+    from presidio.ner import triton_recognizer as module
     from presidio.tests.test_ner import FakeTokenizer
-    monkeypatch.setenv('PRESIDIO_ANALYZER_NER_BACKEND', 'triton')
     model, state = fixture_model()
-    monkeypatch.setattr('presidio.ner.triton_model.TritonModel', lambda *_args: model)
-    (tmp_path / 'config.json').write_text(json.dumps({'architectures': ['BertForTokenClassification'],
-                                                     'id2label': EXPECTED_ID2LABEL}))
-    monkeypatch.setattr(module, 'load_and_verify_embedded_manifest', lambda _path: SimpleNamespace(
-        model_id=PROFILES['tiny2'].model_id, revision=PROFILES['tiny2'].revision,
-        architecture='BertForTokenClassification'))
-    monkeypatch.setattr(transformers.AutoTokenizer, 'from_pretrained', lambda *_a, **_kw: FakeTokenizer([(0, 4)]))
-    def prohibited(*_a, **_kw):
-        raise AssertionError('Local model weights must not be loaded by Triton Analyzer')
-    monkeypatch.setattr(transformers.AutoModelForTokenClassification, 'from_pretrained', prohibited)
-    recognizer = HuggingFaceNERRecognizer(profile=PROFILES['tiny2'], model_directory=tmp_path)
+    monkeypatch.setattr("presidio.ner.triton_model.TritonModel", lambda *_args: model)
+    (tmp_path / "config.json").write_text(json.dumps({"vocab_size": 3}))
+    monkeypatch.setattr(module, "load_and_verify_runtime_artifact", lambda _path: SimpleNamespace(
+        model_id=PROFILES["tiny2"].model_id, revision=PROFILES["tiny2"].revision,
+        architecture="BertForTokenClassification"))
+    monkeypatch.setattr("presidio.ner.tokenization.ContentTokenizer", lambda _p: FakeTokenizer([(0, 4)]))
+    recognizer = TritonNERRecognizer(model_directory=tmp_path)
     recognizer.load_model()
     assert recognizer.is_ready()
-    assert state['last_inputs']['inputs'][0]['shape'] == [1, 386]
-    state['ready'] = False
+    assert state["last_inputs"]["inputs"][0]["shape"] == [1, 386]
+    state["ready"] = False
+    recognizer._next_probe_at = 0
     with pytest.raises(NERUnavailableError):
         recognizer.require_ready()
-    assert recognizer.state() == 'failed'
+    assert recognizer.state() == "failed"

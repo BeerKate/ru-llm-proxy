@@ -25,13 +25,16 @@ def test_makefile_exposes_separate_real_model_and_proxy_gates():
     makefile = _read(ROOT / "Makefile")
 
     assert "test-hf-model-run:" in makefile
-    assert "python verify_cpu_runtime.py" in makefile
-    assert "python verify_gpu_runtime.py" in makefile
-    assert "ANALYZER_PROFILE" in makefile
-    assert "docker run --rm --network none $(ANALYZER_IMAGE)" in makefile
+    smoke = _read(ROOT / "tests/e2e/model_smoke.py")
+    assert "verify_cpu_runtime.py" in smoke
+    assert "verify_triton_service.py" in smoke
+    assert "ANALYZER_PROFILE" not in makefile
+    assert '"--internal"' in smoke
+    assert "offline_probe" in smoke
     assert "test-ner-proxy:" in makefile
-    assert "bash tests/e2e/test_ner_proxy_flow.sh" in makefile
-    assert "docker-compose.ner-proxy.gpu.yml" in _read(SCRIPT)
+    assert "$(NER_TEST) proxy" in makefile
+    assert "docker-compose.ner-proxy.gpu.yml" not in _read(SCRIPT)
+    assert "reject_removed_settings" in _read(SCRIPT)
     assert "test-ner-integration:" in makefile
     assert "tests/test_ner_integration_config.py" in makefile
 
@@ -46,11 +49,21 @@ def test_real_model_workflow_is_cached_bounded_and_secret_free():
     assert "load: true" in workflow
     assert "cache-from: type=gha,scope=presidio-analyzer" in workflow
     assert "cache-to: type=gha,mode=max,scope=presidio-analyzer" in workflow
-    assert "timeout-minutes: 45" in workflow
+    assert "timeout-minutes: 60" in workflow
     assert "run: make test-hf-model-run" in workflow
     assert "run: make test-ner-proxy" in workflow
     assert "workflow_dispatch:" in workflow
     assert "secrets." not in workflow
+
+
+@pytest.mark.parametrize("event", ["pull_request", "push"])
+def test_ner_workflow_tracks_actual_litellm_image_definition(event):
+    workflow = yaml.load(_read(WORKFLOW), Loader=yaml.BaseLoader)
+    paths = workflow["on"][event]["paths"]
+
+    assert (ROOT / "litellm/Dockerfile").is_file()
+    assert "litellm/Dockerfile" in paths
+    assert "Dockerfile" not in paths
 
 
 def test_proxy_compose_uses_real_analyzer_and_both_pii_modes():
@@ -58,7 +71,7 @@ def test_proxy_compose_uses_real_analyzer_and_both_pii_modes():
     yaml.safe_load(compose)
 
     assert "pull_policy: never" in compose
-    assert "ru-llm-proxy-presidio-analyzer:latest" in compose
+    assert "ru-llm-proxy-ner-tests:analyzer" in compose
     assert "PRESIDIO_ANALYZER_URL=http://presidio-analyzer:5001" in compose
     assert "PII_GUARDRAIL_MODE=mask" in compose
     assert "PII_GUARDRAIL_MODE=block" in compose
@@ -239,4 +252,4 @@ def test_coverage_matrix_documents_all_test_layers_and_entity_types():
 
     assert "make test-ner-integration" in coverage
     assert "--network none" in coverage
-    assert "45 минутами" in coverage
+    assert "60 минутами" in coverage

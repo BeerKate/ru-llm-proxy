@@ -920,7 +920,7 @@ async def _health_is_unhealthy_when_required_ner_is_not_loaded(monkeypatch):
     assert body["ner_required"] is True
     assert body["ner_failure_phase"] == "artifact_verification"
     assert body["ner_failure_class"] == "artifact_invalid"
-    assert body["ner_backend"] == "huggingface_transformers"
+    assert body["ner_backend"] == "triton_onnxruntime"
     assert body["ner_model"] == analyzer_server.MODEL_ID
     assert body["ner_revision"] == analyzer_server.MODEL_REVISION
     assert body["analysis_signature"] == analyzer_server.ANALYSIS_SIGNATURE
@@ -993,7 +993,7 @@ async def _health_reports_fixed_model_identity(monkeypatch):
     assert response["ner_state"] == "ready"
     assert response["ner_warmed_up"] is True
     assert response["ner_required"] is True
-    assert response["ner_backend"] == "huggingface_transformers"
+    assert response["ner_backend"] == "triton_onnxruntime"
     assert response["ner_model"] == analyzer_server.MODEL_ID
     assert response["ner_revision"] == analyzer_server.MODEL_REVISION
     assert response["analysis_signature"] == analyzer_server.ANALYSIS_SIGNATURE
@@ -1034,11 +1034,23 @@ def test_analysis_signature_tracks_registry_source_changes(monkeypatch, source_n
     assert analyzer_server._build_analysis_signature() != baseline
 
 
-def test_boundary_recheck_mode_invalidates_analysis_signature(monkeypatch):
+def test_removed_boundary_recheck_env_is_not_an_algorithm_switch(monkeypatch):
     monkeypatch.setenv("PRESIDIO_ANALYZER_NER_BOUNDARY_RECHECK", "off")
     before = analyzer_server._build_analysis_signature()
     monkeypatch.setenv("PRESIDIO_ANALYZER_NER_BOUNDARY_RECHECK", "shell-prompt")
-    assert analyzer_server._build_analysis_signature() != before
+    assert analyzer_server._build_analysis_signature() == before
+
+
+def test_analysis_signature_tracks_local_export_metadata(monkeypatch, tmp_path):
+    path = tmp_path / "export-manifest.json"
+    monkeypatch.setattr(analyzer_server, "EXPORT_MANIFEST_PATH", path)
+    absent = analyzer_server._build_analysis_signature()
+    path.write_text('{"onnx_sha256":"first"}')
+    first = analyzer_server._build_analysis_signature()
+    assert first != absent
+    assert analyzer_server._build_analysis_signature() == first
+    path.write_text('{"onnx_sha256":"second"}')
+    assert analyzer_server._build_analysis_signature() != first
 
 
 def test_boundary_recheck_receives_chunk_local_native_protection(monkeypatch):
@@ -1079,7 +1091,7 @@ async def _lifespan_refuses_to_start_when_required_ner_fails(monkeypatch, caplog
     )
 
     with caplog.at_level(logging.ERROR, logger="presidio.analyzer_server"):
-        with pytest.raises(RuntimeError, match="Hugging Face NER is required"):
+        with pytest.raises(RuntimeError, match="CPU Triton NER is required"):
             async with analyzer_server.lifespan(None):
                 pass
 
@@ -1113,14 +1125,11 @@ async def _lifespan_emits_safe_ner_startup_events(monkeypatch, caplog):
         analyzer_server.ner_recognizer,
         "runtime_info",
         lambda: {
-            "profile": "gpu",
-            "device": "cuda:0",
-            "precision": "fp16",
+            "profile": "cpu",
+            "backend": "triton",
+            "device": "cpu",
+            "precision": "fp32",
             "inference_batch_size": 8,
-            "device_name": "Synthetic GPU",
-            "compute_capability": "7.5",
-            "cuda_version": "12.6",
-            "gpu_memory_total_bytes": 16 * 1024**3,
             "model_profile": "tiny2",
             "o_logit_bias": 1.0,
             "span_postprocessing": "secrets-contracts",
@@ -1145,14 +1154,10 @@ async def _lifespan_emits_safe_ner_startup_events(monkeypatch, caplog):
             "revision": analyzer_server.MODEL_REVISION,
             "state": "ready",
             "warmed_up": True,
-            "device_profile": "gpu",
-            "device": "cuda:0",
-            "precision": "fp16",
+            "device_profile": "cpu",
+            "device": "cpu",
+            "precision": "fp32",
             "inference_batch_size": 8,
-            "device_name": "Synthetic GPU",
-            "compute_capability": "7.5",
-            "cuda_version": "12.6",
-            "gpu_memory_total_bytes": 16 * 1024**3,
             "model_profile": "tiny2",
             "o_logit_bias": 1.0,
             "span_postprocessing": "secrets-contracts",

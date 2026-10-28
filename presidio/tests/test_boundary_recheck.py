@@ -8,10 +8,10 @@ from presidio.ner.boundary_recheck import (
     confirmed_prompt_edges, eligible_prompt, resolve_recheck, prediction_key,
 )
 from presidio.ner.text_processing import normalize_for_ner
-from presidio.ner.huggingface_recognizer import (
+from presidio.ner.triton_recognizer import (
     EntityPrediction, WindowEntityPrediction, UnresolvedWindowEntityCluster,
     TokenPrediction, NERWindowAnalysis, NER_STATE_READY, NERProcessingError,
-    HuggingFaceNERRecognizer, NERInferenceCancelled,
+    TritonNERRecognizer, NERInferenceCancelled,
 )
 
 
@@ -121,25 +121,69 @@ def test_credentials_and_unknown_punctuation_are_not_exceptions(text):
     assert not eligible_prompt(text, start, start + 1)
 
 
-def test_config_default_and_invalid_profiles(monkeypatch):
-    monkeypatch.delenv("PRESIDIO_ANALYZER_NER_BOUNDARY_RECHECK", raising=False)
-    assert resolve_recheck("bert") == "off"
-    monkeypatch.setenv("PRESIDIO_ANALYZER_NER_BOUNDARY_RECHECK", "shell-prompt")
-    assert resolve_recheck("tiny2") == "shell-prompt"
-    with pytest.raises(ValueError):resolve_recheck("bert")
-    monkeypatch.setenv("PRESIDIO_ANALYZER_NER_BOUNDARY_RECHECK", "typo")
-    with pytest.raises(ValueError):resolve_recheck("tiny2")
+@pytest.mark.parametrize("line,edge", [
+    ("bash-$", "-$"), ("  zsh> tool --flag", ">"),
+    ("\tfish $ printf hello", "$"), ("sh#", "#"),
+])
+def test_only_prompt_punctuation_is_eligible_with_original_offsets(line, edge):
+    text = "Контекст🙂\n" + line + "\nследующая строка"
+    start = text.index(edge)
+    assert eligible_prompt(text, start, start + len(edge))
+
+
+@pytest.mark.parametrize("line,value", [
+    ("bash-$ tool '-$'", "-$"),
+    ("zsh> tool '>'", ">"),
+    ("fish$ tool '$'", "$"),
+    ("sh# tool '#'", "#"),
+    ("bash-$ tool --option=!?", "!?"),
+    ("bash-$ tool -$", "-$"),
+])
+def test_command_argument_punctuation_is_never_negative_prompt_evidence(line, value):
+    start = line.rindex(value)
+    assert not eligible_prompt(line, start, start + len(value))
+
+
+def test_confirm_does_not_withdraw_a_punctuation_secret_inside_command_arguments():
+    case = setup_case("x" * 400 + "\nbash-$ tool '-$'\n" + "y" * 600)
+    normalized, ids, offsets, _ = case
+    start = normalized.text.index("-$'\n")
+    prediction = WindowEntityPrediction(EntityPrediction("PASSWORD", start, start + 2, .7), 0, False, True)
+    cluster = UnresolvedWindowEntityCluster("PASSWORD", (prediction,))
+    assert confirm((normalized, ids, offsets, (cluster,))) == (set(), 0)
+
+
+def test_disagreeing_centers_do_not_withdraw_a_prompt_detection():
+    def disagree(_ids, batch_offsets):
+        result = inference()(_ids, batch_offsets)
+        return [result[0], [TokenPrediction("B-PASSWORD", p.start, p.end, .98) for p in result[1]]]
+    assert not confirm(setup_case(), infer=disagree)[0]
+
+
+def test_cancellation_before_work_is_not_negative_evidence():
+    def cancelled():
+        raise NERInferenceCancelled()
+    with pytest.raises(NERInferenceCancelled):
+        confirm(setup_case(), cancelled=cancelled)
+
+
+def test_config_keeps_the_e6_default_without_a_public_switch():
+    assert resolve_recheck("tiny2") == "off"
+    with pytest.raises(ValueError):
+        resolve_recheck("bert")
 
 
 @pytest.mark.parametrize("enabled,protected,success", [(True, (), True), (True, None, False), (False, (), False)])
 def test_real_recognizer_merge_is_opt_in_and_requires_native_evidence(monkeypatch, enabled, protected, success):
-    monkeypatch.setenv("PRESIDIO_ANALYZER_NER_BOUNDARY_RECHECK", "shell-prompt" if enabled else "off")
+    monkeypatch.setattr("presidio.ner.triton_recognizer.resolve_recheck",
+                        lambda _: "shell-prompt" if enabled else "off")
     normalized, ids, offsets, clusters = setup_case()
-    r = HuggingFaceNERRecognizer(profile=PROFILES["tiny2"])
+    r = TritonNERRecognizer(profile=PROFILES["tiny2"])
     def load():
         r._state = NER_STATE_READY
         r._warmed_up = True
-        r._model = object()
+        from types import SimpleNamespace
+        r._model = SimpleNamespace(ready=lambda: True)
         r._tokenizer = object()
     monkeypatch.setattr(r, "load_model", load)
     monkeypatch.setattr(r, "_predict_window_entities", lambda *_a, **_k: NERWindowAnalysis(list(clusters[0].predictions), 1, len(ids)))

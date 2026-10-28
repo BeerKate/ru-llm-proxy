@@ -17,19 +17,17 @@ from presidio.model_profiles import (
 PRESIDIO = Path(__file__).resolve().parents[1]
 
 
-def test_default_profile_is_the_original_bert_without_decoding_changes():
+def test_default_profile_is_the_single_pinned_model():
     profile = resolve_profile({})
 
-    assert DEFAULT_PROFILE == "bert"
-    assert profile.name == "bert"
-    assert profile.model_id == "fef2/ner_rus_bert-secret_detection"
-    assert profile.o_logit_bias == 0.0
-    assert profile.span_postprocessing == "none"
-    assert profile.spacy_disabled_pipes == ()
+    assert DEFAULT_PROFILE == "tiny2"
+    assert set(PROFILES) == {"tiny2"}
+    assert profile.name == "tiny2"
+    assert profile.model_id == "Katerina-Bir/rubert-tiny2-secret-detection"
 
 
 def test_tiny2_profile_enables_validated_decoding_settings():
-    profile = resolve_profile({"PRESIDIO_ANALYZER_NER_MODEL_PROFILE": "tiny2"})
+    profile = resolve_profile({})
 
     assert profile.o_logit_bias == 1.0
     assert profile.span_postprocessing == "secrets-contracts"
@@ -39,36 +37,21 @@ def test_tiny2_profile_enables_validated_decoding_settings():
     assert "lemmatizer" not in profile.spacy_disabled_pipes
 
 
-def test_empty_overrides_keep_profile_defaults():
-    profile = resolve_profile(
-        {
-            "PRESIDIO_ANALYZER_NER_MODEL_PROFILE": "tiny2",
-            "PRESIDIO_ANALYZER_NER_O_LOGIT_BIAS": "",
-            "PRESIDIO_ANALYZER_NER_SPAN_POSTPROCESSING": " ",
-        }
-    )
-
-    assert profile == PROFILES["tiny2"]
-
-
-def test_overrides_are_applied_to_the_selected_profile():
-    profile = resolve_profile(
-        {
-            "PRESIDIO_ANALYZER_NER_MODEL_PROFILE": "BERT",
-            "PRESIDIO_ANALYZER_NER_O_LOGIT_BIAS": "1.5",
-            "PRESIDIO_ANALYZER_NER_SPAN_POSTPROCESSING": "secrets",
-        }
-    )
-
-    assert profile.name == "bert"
-    assert profile.o_logit_bias == 1.5
-    assert profile.span_postprocessing == "secrets"
+@pytest.mark.parametrize("value", ["", "tiny2", "bert", "1.5", "secrets"])
+@pytest.mark.parametrize("key", [
+    "NER_MODEL_PROFILE", "PRESIDIO_ANALYZER_NER_MODEL_PROFILE",
+    "PRESIDIO_ANALYZER_NER_O_LOGIT_BIAS", "PRESIDIO_ANALYZER_NER_SPAN_POSTPROCESSING",
+])
+def test_removed_overrides_are_rejected_even_when_they_match_defaults(key, value):
+    with pytest.raises(ModelProfileError, match=key):
+        resolve_profile({key: value})
 
 
 @pytest.mark.parametrize(
     "environ",
     [
         {"PRESIDIO_ANALYZER_NER_MODEL_PROFILE": "gpt"},
+        {"PRESIDIO_ANALYZER_NER_MODEL_PROFILE": "bert"},
         {"PRESIDIO_ANALYZER_NER_O_LOGIT_BIAS": "high"},
         {"PRESIDIO_ANALYZER_NER_O_LOGIT_BIAS": "-1"},
         {"PRESIDIO_ANALYZER_NER_O_LOGIT_BIAS": "nan"},
@@ -100,7 +83,7 @@ def test_each_profile_manifest_matches_its_identity(name):
 
 
 def test_tiny2_manifest_pins_the_released_weights():
-    manifest = load_manifest(PRESIDIO / "model_manifest.tiny2.json")
+    manifest = load_manifest(PRESIDIO / "model_manifest.json")
     weights = {model_file.path: model_file for model_file in manifest.files}
 
     assert (
@@ -129,8 +112,7 @@ def test_tiny2_sentencizer_restores_sentence_starts_without_the_parser():
 
     from model_profiles import SPACY_LEMMA_ONLY_DISABLED
 
-    assert resolve_profile({"PRESIDIO_ANALYZER_NER_MODEL_PROFILE": "tiny2"}).spacy_sentencizer
-    assert not resolve_profile({}).spacy_sentencizer
+    assert resolve_profile({}).spacy_sentencizer
     nlp = spacy.load("ru_core_news_sm")
     for pipe in SPACY_LEMMA_ONLY_DISABLED:
         nlp.disable_pipe(pipe)
