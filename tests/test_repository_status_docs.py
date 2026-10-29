@@ -113,7 +113,7 @@ def test_ner_migration_research_links_resolve():
 
 
 def test_tiny2_current_status_preserves_owner_acceptance_and_limits():
-    for name in ("README.md", "docs/architecture.md", "docs/deployment.md", "docs/ner-triton.md"):
+    for name in ("README.md", "docs/architecture.md", "docs/deployment.md", "docs/ner-triton.md", "docs/compliance.md"):
         content = (ROOT / name).read_text(encoding="utf-8")
         assert "ещё не принят" not in content
         assert "Приёмка качества остаётся за владельцем" not in content
@@ -130,3 +130,9 @@ def test_tiny2_current_status_preserves_owner_acceptance_and_limits():
     assert "сырые TP/FP/FN остаются неизменными" in current
     assert "T01" in current and "CANCEL-OBS-01" in current and "LIVE04" in current
     assert "Переход не принят: есть подтверждённые пропуски" in quality
+    compliance = (ROOT / "docs/compliance.md").read_text(encoding="utf-8")
+    assert "Строгий набор кандидата PR #109 пока неуспешен" not in compliance
+    assert "20 известных ухудшений покрытия" in compliance
+    coverage = (ROOT / "docs/research/ner-migration-test-coverage.md").read_text(encoding="utf-8")
+    assert "Владелец принял переход" in coverage
+    assert "18 отклонений" in coverage and "20 известных ухудшений покрытия" in coverage
