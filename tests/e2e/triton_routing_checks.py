@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
+import ipaddress
 import json
 import re
 import subprocess
@@ -100,12 +101,30 @@ HTTPServer(('0.0.0.0', 8000), Handler).serve_forever()
 """
 
 
+def network_ipv4_subnet(network):
+    try:
+        rows = json.loads(output("network", "inspect", network))
+        if not isinstance(rows, list) or len(rows) != 1 or rows[0]["Internal"] is not True:
+            raise ValueError
+        configs = rows[0]["IPAM"]["Config"]
+        if not isinstance(configs, list):
+            raise ValueError
+        subnets = [ipaddress.ip_network(item["Subnet"]) for item in configs]
+        ipv4 = [subnet for subnet in subnets if subnet.version == 4]
+        if len(ipv4) != 1 or ipv4[0].num_addresses < 4:
+            raise ValueError
+        return str(ipv4[0])
+    except (ValueError, TypeError, KeyError, IndexError):
+        raise RuntimeError("Test network must have one usable IPv4 subnet") from None
+
+
 def check_no_replay():
     prefix = "ru-ner-no-replay-" + uuid.uuid4().hex[:8]
     nginx, first, second = [prefix + suffix for suffix in ("-nginx", "-a", "-b")]
     names = [nginx, first, second]
     try:
         output("network", "create", "--internal", prefix)
+        subnet = network_ipv4_subnet(prefix)
         for name in (first, second):
             output("run", "-d", "--name", name, "--network", prefix, "--network-alias", "ner-triton",
                    "python:3.12-slim", "python", "-c", COUNTER_SERVER)
@@ -135,7 +154,8 @@ def check_no_replay():
         counts = [int(output("exec", name, "python", "-c", get.format(url="http://127.0.0.1:8000/count")))
                   for name in (first, second)]
         assert sorted(counts) == [0, 1], "Nginx replayed one POST to another peer"
-        return {"check": "single_post_no_replay", "status": "passed", "peer_post_counts": counts}
+        return {"check": "single_post_no_replay", "status": "passed", "peer_post_counts": counts,
+                "ipv4_subnet": subnet}
     finally:
         subprocess.run(["docker", "rm", "-f", *names], capture_output=True, timeout=30)
         removed = subprocess.run(["docker", "network", "rm", prefix], capture_output=True, timeout=30)

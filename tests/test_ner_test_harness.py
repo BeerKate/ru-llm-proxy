@@ -1,5 +1,6 @@
 """Exercise test orchestration without Docker, model downloads or API keys."""
 import json
+import ipaddress
 import os
 import signal
 from pathlib import Path
@@ -244,20 +245,165 @@ def test_cleanup_failure_cannot_leave_a_passed_report(tmp_path, monkeypatch):
 
 
 @pytest.mark.parametrize("stack", ["litellm-presidio", "litellm-presidio-codex-lb"])
+@pytest.mark.parametrize("topology", ["functional", "production"])
 @pytest.mark.parametrize("count", [1, 2])
-def test_topology_context_is_offline_isolated_and_uses_small_test_resources(tmp_path, stack, count):
+def test_topology_context_is_offline_isolated_and_uses_small_test_resources(tmp_path, stack, topology, count):
     gate = Gate(tmp_path, images=dict(support.IMAGE_TAGS))
+    gate.ipv4_subnet = "172.28.0.0/16"
     before = gate.secrets()
-    ctx = gate.context(stack, "production", "mask", triton_replicas=count)
+    working_files = {path: path.read_bytes() for path in ROOT.glob("docker-compose*.yml")}
+    ctx = gate.context(stack, topology, "mask", triton_replicas=count)
     overlay = json.loads(gate.overlay.read_text())
-    assert overlay["networks"]["ru-llm-proxy"]["internal"]
+    assert overlay["networks"]["ru-llm-proxy"] == {
+        "internal": True, "ipam": {"config": [{"subnet": "172.28.0.0/18"}]}}
+    assert overlay["networks"]["test-ingress"] == {"ipam": {"config": [{"subnet": "172.28.64.0/18"}]}}
+    used_networks = {network for service in ctx.model["services"].values() for network in service.get("networks", [])}
+    assert used_networks == set(overlay["networks"])
+    assert all(network.get("ipam", {}).get("config") for network in overlay["networks"].values())
     assert overlay["services"]["nginx"]["networks"][:2] == ["ru-llm-proxy", "test-ingress"]
     assert "container_name" not in overlay["services"]["ner-triton"]
-    assert ctx.counts["ner-triton"] == count
-    assert ctx.counts["presidio-analyzer"] == 2
-    assert ctx.values["LITELLM_MEMORY"] == "2g"
+    assert ctx.counts["ner-triton"] == (count if topology == "production" else 1)
+    assert ctx.counts["presidio-analyzer"] == (2 if topology == "production" else 1)
+    if topology == "production":
+        assert ctx.values["LITELLM_MEMORY"] == "2g"
     assert gate.secrets() == before
     assert str(ROOT / ".env") != str(ctx.env_file)
+    assert all(path.read_bytes() == body for path, body in working_files.items())
+
+
+def test_topology_context_requires_subnet_without_contacting_docker(tmp_path, monkeypatch):
+    import deployment_topology_gate as topology
+    monkeypatch.setattr(topology, "docker", lambda *a: pytest.fail("Unexpected Docker call"))
+    gate = Gate(tmp_path, images=dict(support.IMAGE_TAGS))
+    with pytest.raises(RuntimeError, match="IPv4 subnet"):
+        gate.context("litellm-presidio", "functional", "mask")
+    assert not gate.overlay.exists() and gate.last_context is None
+
+
+@pytest.mark.parametrize("subnet", ["172.28.0.0/16", "10.231.0.0/24", "10.231.0.0/25"])
+@pytest.mark.parametrize("extended", [False, True])
+def test_all_topology_networks_have_disjoint_explicit_subnets(subnet, extended):
+    from deployment_topology_gate import topology_networks
+    networks = topology_networks(subnet, extended)
+    assert set(networks) == ({"ru-llm-proxy", "test-ingress", "codex-lb-proxy", "codex-lb-database"}
+                             if extended else {"ru-llm-proxy", "test-ingress"})
+    children = [ipaddress.IPv4Network(network["ipam"]["config"][0]["subnet"]) for network in networks.values()]
+    assert all(child.subnet_of(ipaddress.IPv4Network(subnet)) and child.num_addresses >= 32 for child in children)
+    assert not any(a.overlaps(b) for i, a in enumerate(children) for b in children[i + 1:])
+    assert {name for name, network in networks.items() if network.get("internal")} == (
+        {"ru-llm-proxy", "codex-lb-database"} if extended else {"ru-llm-proxy"})
+    assert not any(network.get("external") or network.get("name") for network in networks.values())
+
+
+@pytest.mark.parametrize("subnet", [None, "private-invalid", "fd00::/64", "172.28.0.1/16",
+                                     "172.28.0.0/26", "172.28.0.0/32"])
+def test_invalid_or_small_topology_subnet_fails_before_a_stand_is_created(subnet):
+    from deployment_topology_gate import topology_networks
+    with pytest.raises(RuntimeError, match="at least 30 hosts") as captured:
+        topology_networks(subnet, True)
+    assert "private" not in str(captured.value)
+
+
+@pytest.mark.parametrize("configs", [
+    [{"Subnet": "172.28.0.0/16", "Gateway": "172.28.0.1"}],
+    [{"Subnet": "fd00::/64"}, {"Subnet": "172.28.0.0/16"}],
+])
+def test_test_network_subnet_is_read_from_docker_not_hardcoded(monkeypatch, configs):
+    import triton_routing_checks as routing
+    calls = []
+    monkeypatch.setattr(routing, "output", lambda *args: calls.append(args) or json.dumps(
+        [{"Internal": True, "IPAM": {"Config": configs}}]))
+    assert routing.network_ipv4_subnet("test-only-network") == "172.28.0.0/16"
+    assert calls == [("network", "inspect", "test-only-network")]
+
+
+@pytest.mark.parametrize("data", [
+    "not-json", "[]", "null", "{}", json.dumps([None]),
+    json.dumps([{"Internal": True}]),
+    *[json.dumps([{"Internal": True, "IPAM": {"Config": config}}]) for config in (
+        None, {}, [], [{}], [{"Subnet": "private-invalid-value"}],
+        [{"Subnet": "172.28.0.1/16"}], [{"Subnet": "172.28.0.0/31"}],
+        [{"Subnet": "fd00::/64"}],
+        [{"Subnet": "172.28.0.0/16"}, {"Subnet": "172.29.0.0/16"}],
+    )],
+    json.dumps([{"Internal": False, "IPAM": {"Config": [{"Subnet": "172.28.0.0/16"}]}}]),
+])
+def test_missing_or_invalid_test_network_subnet_fails_closed(monkeypatch, data):
+    import triton_routing_checks as routing
+    monkeypatch.setattr(routing, "output", lambda *args: data)
+    with pytest.raises(RuntimeError, match="one usable IPv4 subnet") as captured:
+        routing.network_ipv4_subnet("test-only-network")
+    assert "private" not in str(captured.value)
+
+
+@pytest.mark.parametrize("failure", [None, "metadata", "post", "cleanup", "interrupt"])
+def test_no_replay_subnet_is_returned_only_after_successful_check_and_cleanup(monkeypatch, failure):
+    import triton_routing_checks as routing
+    calls = []
+
+    def output(*args):
+        calls.append(args)
+        if args[:2] == ("network", "inspect"):
+            if failure == "interrupt":
+                raise KeyboardInterrupt
+            return "[]" if failure == "metadata" else json.dumps([
+                {"Internal": True, "IPAM": {"Config": [{"Subnet": "172.28.0.0/16"}]}}])
+        if args[0] == "inspect":
+            prefix = args[1].removesuffix("-nginx")
+            return json.dumps([{"NetworkSettings": {"Networks": {prefix: {"IPAddress": "172.28.0.4"}}}}])
+        if args[0] == "exec" and "urllib.error" in args[-1]:
+            return "200" if failure == "post" else "503"
+        if args[0] == "exec" and "/count" in args[-1]:
+            return "0" if args[1].endswith("-a") else "1"
+        return "test-output"
+
+    cleanup = []
+    def run(args, **kwargs):
+        cleanup.append(args)
+        return SimpleNamespace(returncode=1 if failure == "cleanup" and args[1:3] == ["network", "rm"] else 0)
+
+    monkeypatch.setattr(routing, "output", output)
+    monkeypatch.setattr(routing, "wait_ready", lambda *a: None)
+    monkeypatch.setattr(routing.subprocess, "run", run)
+    if failure:
+        error = {"metadata": RuntimeError, "post": AssertionError, "cleanup": RuntimeError,
+                 "interrupt": KeyboardInterrupt}[failure]
+        with pytest.raises(error):
+            routing.check_no_replay()
+    else:
+        assert routing.check_no_replay() == {"check": "single_post_no_replay", "status": "passed",
+                                            "peer_post_counts": [0, 1], "ipv4_subnet": "172.28.0.0/16"}
+    prefix = calls[0][-1]
+    assert cleanup[0] == ["docker", "rm", "-f", prefix + "-nginx", prefix + "-a", prefix + "-b"]
+    assert cleanup[1] == ["docker", "network", "rm", prefix]
+    if failure == "cleanup":
+        assert cleanup[2] == ["docker", "network", "inspect", prefix]
+
+
+@pytest.mark.parametrize("cleanup_failed", [False, True])
+def test_topology_run_uses_subnet_only_after_no_replay_cleanup(monkeypatch, tmp_path, cleanup_failed):
+    import deployment_topology_gate as topology
+    import triton_routing_checks as routing
+    gate = Gate(tmp_path, images=dict(support.IMAGE_TAGS))
+    calls = []
+    result = {"check": "single_post_no_replay", "status": "passed", "ipv4_subnet": "172.28.0.0/16"}
+    def no_replay():
+        if cleanup_failed:
+            raise RuntimeError("No-replay test network cleanup failed")
+        return result
+    def context(*args, **kwargs):
+        calls.append(gate.ipv4_subnet)
+        raise RuntimeError("Stop before starting test containers")
+    monkeypatch.setattr(gate, "sample_memory", lambda: None)
+    monkeypatch.setattr(gate, "context", context)
+    monkeypatch.setattr(topology, "image_id", lambda value: value)
+    monkeypatch.setattr(topology, "identities", lambda images: {})
+    monkeypatch.setattr(routing, "check_no_replay", no_replay)
+    with pytest.raises(RuntimeError):
+        gate.run()
+    assert calls == ([] if cleanup_failed else ["172.28.0.0/16"])
+    assert gate.ipv4_subnet == (None if cleanup_failed else "172.28.0.0/16")
+    assert gate.result["checks"] == ([] if cleanup_failed else [result])
 
 
 def test_all_new_analyzer_tests_run_in_baseline_ci():

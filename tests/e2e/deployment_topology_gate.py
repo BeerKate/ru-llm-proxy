@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import ipaddress
 import json
 import os
 import signal
@@ -65,6 +66,22 @@ def assert_request(url, mode, api, stream, token, phone=PHONE):
             assert "data:" in body, "Expected SSE response"
 
 
+def topology_networks(subnet, extended):
+    try:
+        parent = ipaddress.IPv4Network(subnet)
+        # Four /27 or larger networks leave room for every test replica.
+        if parent.prefixlen > 25:
+            raise ValueError
+    except (ValueError, TypeError):
+        raise RuntimeError("Test IPv4 subnet must allow four networks of at least 30 hosts") from None
+    names = ["ru-llm-proxy", "test-ingress", "codex-lb-proxy", "codex-lb-database"]
+    networks = {name: {"ipam": {"config": [{"subnet": str(child)}]}}
+                for name, child in zip(names, parent.subnets(prefixlen_diff=2))}
+    networks["ru-llm-proxy"]["internal"] = True
+    networks["codex-lb-database"]["internal"] = True
+    return networks if extended else {name: networks[name] for name in names[:2]}
+
+
 class Gate:
     def __init__(self, directory, images=None):
         self.directory = Path(directory)
@@ -86,6 +103,7 @@ class Gate:
         self.peak_memory = {}
         self.result = {"cases": [], "checks": [], "peak_container_memory_bytes": self.peak_memory, "peak_total_memory_bytes": 0}
         self.last_context = None
+        self.ipv4_subnet = None
         self.images = dict(images or IMAGE_TAGS)
         self.result["images"] = dict(self.images)
 
@@ -93,6 +111,9 @@ class Gate:
         return [line for line in self.env_file.read_text().splitlines() if not line.startswith("PII_GUARDRAIL_MODE=")]
 
     def context(self, stack, topology, mode, resources_file=None, triton_replicas=1):
+        if self.ipv4_subnet is None:
+            raise RuntimeError("Test IPv4 subnet must be collected before creating the topology")
+        networks = topology_networks(self.ipv4_subnet, stack.endswith("codex-lb"))
         os.environ.update(COMPOSE_PROJECT_NAME=self.project, STACK=stack, TOPOLOGY=topology, PII_GUARDRAIL_MODE=mode, PII_MODE_ORIGIN="command line", STACK_START_TIMEOUT="360")
         for key in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy", "TOPOLOGY_ENV"):
             os.environ.pop(key, None)
@@ -131,8 +152,7 @@ class Gate:
         for name in ("nginx", "mock-upstream"):
             services[name]["networks"] = ["ru-llm-proxy", "test-ingress"] + (
                 ["codex-lb-proxy"] if name == "nginx" and stack.endswith("codex-lb") else [])
-        self.overlay.write_text(json.dumps({"services": services, "networks": {
-            "ru-llm-proxy": {"internal": True}, "test-ingress": {}}}))
+        self.overlay.write_text(json.dumps({"services": services, "networks": networks}))
         self.ports_reset.write_text("services:\n" + "".join(f"  {service}:\n    ports: !reset []\n" for service in services if service != "mock-upstream"))
         ctx = Context(env_file=str(self.env_file))
         ctx.files.extend([str(self.ports_reset), str(self.overlay)])
@@ -323,7 +343,9 @@ class Gate:
             self.result["images"] = dict(self.images)
             self.result["model"] = identities(self.images)
             self.result["phase"] = "no-replay"
-            self.result["checks"].append(check_no_replay())
+            no_replay = check_no_replay()
+            self.ipv4_subnet = no_replay["ipv4_subnet"]
+            self.result["checks"].append(no_replay)
             for stack in ("litellm-presidio", "litellm-presidio-codex-lb"):
                 token = None
                 affinity = None
