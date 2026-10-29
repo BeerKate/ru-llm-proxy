@@ -669,9 +669,10 @@ def test_instruction_failure_does_not_skip_other_groups(monkeypatch, tmp_path):
     monkeypatch.setattr(module, "check_dialogue_arguments", fail)
     monkeypatch.setattr(module, "check_instructions", lambda *a: calls.append("instructions"))
     monkeypatch.setattr(module, "check_names", lambda *a, **k: calls.append("names"))
+    monkeypatch.setattr(module, "check_accepted_coverage", lambda *a: calls.append("accepted-coverage"))
     with pytest.raises(RuntimeError):
         module.main()
-    assert calls == ["instructions", "names", "names", "names"]
+    assert calls == ["instructions", "names", "names", "names", "accepted-coverage"]
     report = json.loads((tmp_path / "instructions-content.json").read_text())
     assert report["status"] == "failed"
     assert report["checks"][0]["case_id"] == "dialogue_role_which"
