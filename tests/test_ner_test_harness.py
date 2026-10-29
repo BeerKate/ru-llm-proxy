@@ -337,6 +337,144 @@ def test_known_case_prefix_and_http_code_are_value_free_diagnostics():
     assert "private" not in json.dumps(results)
 
 
+@pytest.mark.parametrize("stderr", [
+    "docker: private-token: invalid endpoint settings: user specified IP address is supported only when connecting to networks with user configured subnets private-body",
+    b"docker: private-token: invalid endpoint settings: user specified IP address is supported only when connecting to networks with user configured subnets private-body\xff",
+])
+def test_recovery_diagnostic_reports_only_canonical_error_signatures(stderr):
+    import triton_routing_checks as routing
+    exc = subprocess.CalledProcessError(125, ["docker", "run", "--env", "private-token"],
+                                       output="private-stdout", stderr=stderr)
+    result = routing._command_diagnostic(exc)
+    assert result["operation"] == "docker run" and result["returncode"] == 125
+    assert result["stderr_classes"] == ["explicit_ip_requires_configured_subnet", "invalid_endpoint_settings"]
+    assert "user configured subnet" in result["stderr_excerpt"]
+    assert "private" not in json.dumps(result)
+
+
+@pytest.mark.parametrize("stderr", [None, "", "Bearer private-token\nrequest=private-body", b"\xffprivate-token"])
+def test_unrecognized_recovery_stderr_is_not_disclosed(stderr):
+    import triton_routing_checks as routing
+    result = routing._command_diagnostic(subprocess.CalledProcessError(1, ["docker", "exec", "private"], stderr=stderr))
+    assert result["stderr_classes"] == []
+    assert result["stderr_excerpt"] == "stderr omitted: no allowlisted diagnostic"
+    assert "private" not in json.dumps(result)
+
+
+@pytest.mark.parametrize("command", ["private-token", ["private-token"], ["docker", {"private": "token"}]])
+def test_unrecognized_recovery_argv_and_invalid_returncode_are_not_serialized(command):
+    import triton_routing_checks as routing
+    result = routing._command_diagnostic(subprocess.CalledProcessError("private-returncode", command))
+    assert result["operation"] == "unreported-command" and result["returncode"] is None
+    assert "private" not in json.dumps(result)
+
+
+def test_recovery_diagnostic_is_bounded_and_does_not_search_unbounded_stderr():
+    import triton_routing_checks as routing
+    stderr = "private-token" * 10000 + "address already in use"
+    result = routing._command_diagnostic(subprocess.CalledProcessError(1, ["docker", "run"], stderr=stderr))
+    assert result["stderr_classes"] == []
+    stderr = "no such container; address already in use; permission denied; private-body" * 10000
+    result = routing._command_diagnostic(subprocess.CalledProcessError(1, ["docker", "run"], stderr=stderr))
+    assert result["stderr_classes"] == ["address_in_use", "container_missing", "permission_denied"]
+    assert len(result["stderr_excerpt"]) <= 512
+    assert len(json.dumps(result)) < 2048
+    assert "private" not in json.dumps(result)
+
+
+@pytest.mark.parametrize("exception", [AssertionError("private assertion"),
+                                     subprocess.CalledProcessError(125, ["docker", "run", "private-token"], stderr="address already in use; private-body"),
+                                     KeyboardInterrupt(), SystemExit(143)])
+def test_recovery_substep_preserves_failure_or_interruption(exception, capsys):
+    import triton_routing_checks as routing
+    gate = SimpleNamespace(result={})
+    with pytest.raises(type(exception)) as captured:
+        with routing._recovery_step(gate, "reserve-old-address"):
+            raise exception
+    assert captured.value is exception
+    row = gate.result["recovery_steps"][0]
+    assert row["status"] == ("failed" if isinstance(exception, Exception) else "interrupted")
+    assert row["error_type"] == type(exception).__name__
+    assert "private" not in json.dumps(gate.result) + capsys.readouterr().out
+
+
+def test_recovery_substep_reports_success_without_accepting_arbitrary_labels(capsys):
+    import triton_routing_checks as routing
+    gate = SimpleNamespace(result={})
+    with routing._recovery_step(gate, "select-replicas"):
+        pass
+    assert gate.result["recovery_steps"] == [{"step": "select-replicas", "status": "passed"}]
+    with pytest.raises(ValueError, match="Unknown"):
+        with routing._recovery_step(gate, "private-token"):
+            pytest.fail("Unexpected operation")
+    assert "private" not in json.dumps(gate.result) + capsys.readouterr().out
+
+
+@pytest.mark.parametrize("failure", [None, "reserve-old-address", "reject-mismatched-manifest"])
+def test_recovery_substeps_do_not_change_commands_assertions_or_cleanup(monkeypatch, failure, capsys):
+    import deployment_topology_gate as topology
+    import triton_routing_checks as routing
+    from deployment import DeploymentError
+
+    calls = []
+    original = [{"Id": str(i), "Config": {"Labels": {"com.docker.compose.service": "ner-triton"}},
+                 "NetworkSettings": {"Networks": {"test-network": {"IPAddress": f"172.28.1.{i}"}}}}
+                for i in (2, 3)]
+    replacement = {"Id": "4", "Config": original[0]["Config"],
+                   "NetworkSettings": {"Networks": {"test-network": {"IPAddress": "172.28.1.4"}}}}
+    state = {"health": 0, "started": False}
+    gate = SimpleNamespace(result={"checks": []}, project="test-recovery", url=lambda *a: "http://test")
+
+    def health(*args):
+        calls.append(("health", *args))
+        state["health"] += 1
+        if state["health"] in (1, 3) and failure != "reject-mismatched-manifest":
+            raise DeploymentError("expected rejection")
+
+    def start():
+        calls.append(("start",))
+        state["started"] = True
+
+    ctx = SimpleNamespace(health=health, start=start,
+                          containers=lambda: [original[1], replacement] if state["started"] else original)
+    command_error = subprocess.CalledProcessError(125, ["docker", "run", "private-token"],
+                                                 stderr="invalid endpoint settings: address already in use; private-body")
+
+    def output(*args):
+        calls.append(args)
+        if failure == "reserve-old-address" and args[0] == "run":
+            raise command_error
+        return "test-output"
+
+    monkeypatch.setattr(routing, "output", output)
+    monkeypatch.setattr(routing.subprocess, "run", lambda args, **kw: calls.append(tuple(args)) or SimpleNamespace(returncode=0))
+    monkeypatch.setattr(topology, "request", lambda *a, **k: (200, "+79031234569"))
+    monkeypatch.setattr(topology, "assert_request", lambda *a, **k: calls.append(("assert-restored", *a[1:])))
+    if failure is not None:
+        expected = subprocess.CalledProcessError if failure == "reserve-old-address" else AssertionError
+        with pytest.raises(expected) as captured:
+            routing.check_replica_recovery(gate, ctx, "private-virtual-key")
+        if failure == "reserve-old-address":
+            assert captured.value is command_error
+        assert not state["started"] and gate.result["checks"] == []
+        assert any(row["step"] == failure and row["status"] == "failed" for row in gate.result["recovery_steps"])
+    else:
+        routing.check_replica_recovery(gate, ctx, "private-virtual-key")
+        assert all(row["status"] == "passed" for row in gate.result["recovery_steps"])
+        assert gate.result["checks"][0] == {"check": "triton_replica_recovery", "status": "passed",
+                                          "wrong_artifact_rejected": True, "stopped_replica_rejected": True,
+                                          "client_attempt_statuses": [200], "replacement_new_ip": True}
+    if failure == "reject-mismatched-manifest":
+        assert len([call for call in calls if call[0] == "exec"]) == 2
+        assert not any(call[0] == "stop" for call in calls)
+    else:
+        assert ("stop", "2") in calls and ("rm", "2") in calls
+        assert ("run", "-d", "--name", "test-recovery-address-holder", "--network", "test-network", "--ip", "172.28.1.2",
+                "python:3.12-slim", "sleep", "240") in calls
+        assert calls[-1] == ("docker", "rm", "-f", "test-recovery-address-holder")
+    assert "private" not in json.dumps(gate.result) + capsys.readouterr().out
+
+
 def test_proxy_failure_does_not_skip_topologies(monkeypatch, tmp_path):
     import deployment_topology_gate as topology
     calls = []

@@ -1,7 +1,9 @@
 """Fault injection in disposable test containers only."""
 from __future__ import annotations
 
+from contextlib import contextmanager
 import json
+import re
 import subprocess
 import uuid
 
@@ -10,6 +12,72 @@ from ner_test_support import ROOT, docker, wait_ready
 
 def output(*args):
     return docker(*args, capture_output=True, text=True).stdout.strip()
+
+
+RECOVERY_STEPS = frozenset({
+    "select-replicas", "alter-test-manifest", "reject-mismatched-manifest",
+    "restore-test-manifest", "verify-restored-manifest", "stop-replica",
+    "reject-stopped-replica", "remaining-peer-capacity", "remove-stopped-replica",
+    "reserve-old-address", "start-replacement", "verify-new-address", "verify-restored-response",
+})
+STDERR_SIGNATURES = (
+    (r"user specified IP address is supported only when connecting to networks with user configured subnets",
+     "explicit_ip_requires_configured_subnet", "user specified IP address requires a user configured subnet"),
+    (r"address already in use", "address_in_use", "address already in use"),
+    (r"invalid endpoint settings", "invalid_endpoint_settings", "invalid endpoint settings"),
+    (r"invalid config for network", "invalid_network_config", "invalid config for network"),
+    (r"no such container", "container_missing", "no such container"),
+    (r"container[^\r\n]{0,200}is not running", "container_stopped", "container is not running"),
+    (r"network[^\r\n]{0,200}not found", "network_missing", "network not found"),
+    (r"no space left on device", "disk_full", "no space left on device"),
+    (r"cannot allocate memory", "allocation_failed", "cannot allocate memory"),
+    (r"permission denied", "permission_denied", "permission denied"),
+    (r"connection refused", "connection_refused", "connection refused"),
+    (r"context deadline exceeded", "deadline_exceeded", "context deadline exceeded"),
+)
+
+
+def _command_diagnostic(exc):
+    # Never serialize argv or raw stderr: either may contain credentials or bodies.
+    command = exc.cmd
+    operation = "unreported-command"
+    if (isinstance(command, (list, tuple)) and len(command) >= 2
+            and command[0] == "docker" and isinstance(command[1], str)
+            and command[1] in {"run", "exec", "stop", "rm", "inspect", "network"}):
+        operation = "docker " + command[1]
+    stderr = exc.stderr
+    if isinstance(stderr, bytes):
+        stderr = stderr[:8192].decode("utf-8", errors="replace")
+    elif isinstance(stderr, str):
+        stderr = stderr[:8192]
+    else:
+        stderr = ""
+    recognized = [(category, excerpt) for pattern, category, excerpt in STDERR_SIGNATURES
+                  if re.search(pattern, stderr, re.IGNORECASE)]
+    return {"operation": operation, "returncode": exc.returncode if type(exc.returncode) is int else None,
+            "stderr_classes": [category for category, _ in recognized],
+            "stderr_excerpt": "; ".join(excerpt for _, excerpt in recognized)[:512]
+            if recognized else "stderr omitted: no allowlisted diagnostic"}
+
+
+@contextmanager
+def _recovery_step(gate, name):
+    if name not in RECOVERY_STEPS:
+        raise ValueError("Unknown recovery diagnostic step")
+    result = {"step": name, "status": "running"}
+    gate.result.setdefault("recovery_steps", []).append(result)
+    try:
+        yield result
+    except BaseException as exc:
+        result.update(status="failed" if isinstance(exc, Exception) else "interrupted",
+                      error_type=type(exc).__name__)
+        if isinstance(exc, subprocess.CalledProcessError):
+            result.update(_command_diagnostic(exc))
+        raise
+    else:
+        result["status"] = "passed"
+    finally:
+        print("NER RECOVERY " + json.dumps(result, sort_keys=True), flush=True)
 
 
 COUNTER_SERVER = """
@@ -81,34 +149,41 @@ def check_replica_recovery(gate, ctx, token):
     from deployment import DeploymentError
     from deployment_topology_gate import request, assert_request
 
-    replicas = [c for c in ctx.containers() if c["Config"]["Labels"].get("com.docker.compose.service") == "ner-triton"]
-    assert len(replicas) == 2
-    first = replicas[0]
+    with _recovery_step(gate, "select-replicas"):
+        replicas = [c for c in ctx.containers() if c["Config"]["Labels"].get("com.docker.compose.service") == "ner-triton"]
+        assert len(replicas) == 2
+        first = replicas[0]
     patch = (
         "import json; from pathlib import Path; p=Path('/models/tiny2/export-manifest.json'); "
         "p.with_suffix('.test-backup').write_bytes(p.read_bytes()); d=json.loads(p.read_text()); "
         "d['onnx_sha256']='b'*64; p.write_text(json.dumps(d))"
     )
-    output("exec", first["Id"], "python3", "-c", patch)
+    with _recovery_step(gate, "alter-test-manifest"):
+        output("exec", first["Id"], "python3", "-c", patch)
     try:
+        with _recovery_step(gate, "reject-mismatched-manifest"):
+            try:
+                ctx.health()
+            except DeploymentError:
+                pass
+            else:
+                raise AssertionError("One mismatched replica was hidden by the healthy peer")
+    finally:
+        with _recovery_step(gate, "restore-test-manifest"):
+            output("exec", first["Id"], "python3", "-c",
+                   "from pathlib import Path; p=Path('/models/tiny2/export-manifest.json'); "
+                   "p.write_bytes(p.with_suffix('.test-backup').read_bytes()); p.with_suffix('.test-backup').unlink()")
+    with _recovery_step(gate, "verify-restored-manifest"):
+        ctx.health(20)
+    with _recovery_step(gate, "stop-replica"):
+        output("stop", first["Id"])
+    with _recovery_step(gate, "reject-stopped-replica"):
         try:
             ctx.health()
         except DeploymentError:
             pass
         else:
-            raise AssertionError("One mismatched replica was hidden by the healthy peer")
-    finally:
-        output("exec", first["Id"], "python3", "-c",
-               "from pathlib import Path; p=Path('/models/tiny2/export-manifest.json'); "
-               "p.write_bytes(p.with_suffix('.test-backup').read_bytes()); p.with_suffix('.test-backup').unlink()")
-    ctx.health(20)
-    output("stop", first["Id"])
-    try:
-        ctx.health()
-    except DeploymentError:
-        pass
-    else:
-        raise AssertionError("Stopped replica was accepted as a complete healthy stack")
+            raise AssertionError("Stopped replica was accepted as a complete healthy stack")
     url = gate.url(ctx, "nginx", 80)
     attempts = []
 
@@ -124,19 +199,28 @@ def check_replica_recovery(gate, ctx, token):
         return False
 
     # These are separate client attempts, not automatic replay of one POST.
-    wait_ready(remaining_capacity, 45)
-    network, old_info = next(iter(first["NetworkSettings"]["Networks"].items()))
-    old_ip = old_info["IPAddress"]
-    output("rm", first["Id"])
+    with _recovery_step(gate, "remaining-peer-capacity") as diagnostic:
+        try:
+            wait_ready(remaining_capacity, 45)
+        finally:
+            diagnostic["client_attempt_statuses"] = list(attempts)
+    with _recovery_step(gate, "remove-stopped-replica"):
+        network, old_info = next(iter(first["NetworkSettings"]["Networks"].items()))
+        old_ip = old_info["IPAddress"]
+        output("rm", first["Id"])
     holder = gate.project + "-address-holder"
     try:
-        output("run", "-d", "--name", holder, "--network", network, "--ip", old_ip,
-               "python:3.12-slim", "sleep", "240")
-        ctx.start()
-        current = [c for c in ctx.containers() if c["Config"]["Labels"].get("com.docker.compose.service") == "ner-triton"]
-        replacement = next(c for c in current if c["Id"] not in {r["Id"] for r in replicas})
-        assert replacement["NetworkSettings"]["Networks"][network]["IPAddress"] != old_ip
-        assert_request(gate.url(ctx, "nginx", 80), "mask", "responses", True, token, "+79031234569")
+        with _recovery_step(gate, "reserve-old-address"):
+            output("run", "-d", "--name", holder, "--network", network, "--ip", old_ip,
+                   "python:3.12-slim", "sleep", "240")
+        with _recovery_step(gate, "start-replacement"):
+            ctx.start()
+        with _recovery_step(gate, "verify-new-address"):
+            current = [c for c in ctx.containers() if c["Config"]["Labels"].get("com.docker.compose.service") == "ner-triton"]
+            replacement = next(c for c in current if c["Id"] not in {r["Id"] for r in replicas})
+            assert replacement["NetworkSettings"]["Networks"][network]["IPAddress"] != old_ip
+        with _recovery_step(gate, "verify-restored-response"):
+            assert_request(gate.url(ctx, "nginx", 80), "mask", "responses", True, token, "+79031234569")
     finally:
         subprocess.run(["docker", "rm", "-f", holder], capture_output=True, timeout=30)
     gate.result["checks"].append({"check": "triton_replica_recovery", "status": "passed",
